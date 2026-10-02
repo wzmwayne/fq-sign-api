@@ -47,7 +47,14 @@ data/                          ← 与环境变量 FQ_DATA_DIR 同级即可
 └── ms_16777218.bin            # 可选（上游 unidbg 项目随资源附带的数据文件）
 ```
 
-**一键提取**（从你自己合法持有的 APK）：
+**方式 A：直接下载打包好的数据包（省事）**
+
+- 下载：<https://whdn.lanzouu.com/ipwKO4anf3qh> （蓝奏云，1.45 MB）
+- 校验：`data.zip` 的 **md5 = `2ed93c2e9aaea05e3942972feb749613`**
+- 包内结构就是上面那个 `data/`（含 `md5.txt` 可自查）；解压后与 `fq_download.jar`
+  （或 `compose.yaml`）放在**同一级目录**即可 ✓
+
+**方式 B：从自己的 APK 提取**（能确保版本匹配）
 
 ```bash
 ./scripts/fetch-data.sh /path/to/你的番茄小说.apk
