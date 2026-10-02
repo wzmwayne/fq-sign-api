@@ -12,5 +12,9 @@ services:
       - TZ=Asia/Shanghai
       - FQ_MAX_QUEUE=20      # 排队上限
       - FQ_PER_IP_MS=5000    # 单 IP 间隔(毫秒)
+    volumes:
+      # ★ 官方 so 等放这里（与服务端同目录），不进镜像
+      #   目录里放：libmetasec_ml.so / libc++_shared.so / base.apk(占位) / ms_16777218.bin(可选)
+      - ./data:/app/data:ro
     ports:
       - "127.0.0.1:18090:8090"

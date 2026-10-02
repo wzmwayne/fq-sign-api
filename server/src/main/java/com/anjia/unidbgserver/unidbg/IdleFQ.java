@@ -61,6 +61,47 @@ public class IdleFQ extends AbstractJni implements IOResolver<AndroidFileIO> {
     private File tempRootfsDir;
     private File tempMsCertFile;
 
+    // ============ 外部数据目录（把官方 so 等放到"服务端同目录"，不进 jar）============
+    // 查找顺序: 环境变量 FQ_DATA_DIR -> jar 同级的 data/ -> 当前工作目录的 data/
+    private static volatile File dataDir = null;
+
+    static File dataDir() {
+        if (dataDir == null) {
+            synchronized (IdleFQ.class) {
+                if (dataDir == null) {
+                    File d = null;
+                    String env = System.getenv("FQ_DATA_DIR");
+                    if (env != null && !env.isBlank()) d = new File(env);
+                    if (d == null) {
+                        try {
+                            File jar = new File(IdleFQ.class.getProtectionDomain()
+                                    .getCodeSource().getLocation().toURI());
+                            File base = jar.isFile() ? jar.getParentFile() : jar;
+                            File cand = new File(base, "data");
+                            if (cand.isDirectory()) d = cand;
+                        } catch (Throwable ignored) { }
+                    }
+                    if (d == null) {
+                        File cand = new File("data");
+                        if (cand.isDirectory()) d = cand;
+                    }
+                    dataDir = d;
+                    System.out.println("  [IdleFQ] 外部数据目录: "
+                            + (d == null ? "(未找到，将使用 jar 内资源)" : d.getAbsolutePath()));
+                }
+            }
+        }
+        return dataDir;
+    }
+
+    /** data/ 下的外部文件；不存在则返回 null（回退到 jar 内资源） */
+    private static File external(String name) {
+        File d = dataDir();
+        if (d == null) return null;
+        File f = new File(d, name);
+        return (f.isFile() && f.length() > 0) ? f : null;
+    }
+
     public IdleFQ(boolean loggable) {
         this.loggable = loggable;
         try {
@@ -110,10 +151,12 @@ public class IdleFQ extends AbstractJni implements IOResolver<AndroidFileIO> {
 
     private void initTempFiles() throws IOException {
         try {
-            tempApkFile = TempFileUtils.getTempFile(APK_PATH);
-            tempSoMetasecMlFile = TempFileUtils.getTempFile(SO_METASEC_ML_PATH);
-            tempSoCShareFile = TempFileUtils.getTempFile(SO_C_SHARE_PATH);
-            tempMsCertFile = TempFileUtils.getTempFile(MS_CERT_FILE_PATH);
+            File f;
+            // ① 优先使用 data/ 下的外部文件（把官方 so 放在服务端同目录，不进 jar）
+            f = external("base.apk");           tempApkFile        = (f != null) ? f : TempFileUtils.getTempFile(APK_PATH);
+            f = external("libmetasec_ml.so");   tempSoMetasecMlFile= (f != null) ? f : TempFileUtils.getTempFile(SO_METASEC_ML_PATH);
+            f = external("libc++_shared.so");   tempSoCShareFile   = (f != null) ? f : TempFileUtils.getTempFile(SO_C_SHARE_PATH);
+            f = external("ms_16777218.bin");    tempMsCertFile     = (f != null) ? f : TempFileUtils.getTempFile(MS_CERT_FILE_PATH);
             tempRootfsDir = createTempDir("fq_rootfs");
             if (loggable) {
                 log.debug("临时APK文件: {}", tempApkFile.getAbsolutePath());

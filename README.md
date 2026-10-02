@@ -35,19 +35,32 @@ X-Argus     X-Helios    X-Gorgon   X-Medusa
 - `/health` 监控端点（`inflight` / `served` / `rejected`）
 - 容器化部署（`deploy/` 下有 Dockerfile 与 compose）
 
-## 准备工作（必须）
+## 准备工作：把官方库放到「服务端同目录的 data/」
 
-你没有官方 `.so`，服务就跑不起来。请自行从**你自己安装的番茄小说 App**中提取，并放到：
+本仓库**不包含**官方二进制，需要你自己准备。**推荐放在服务端同目录的 `data/` 下**（这样它不会被打进 jar / 镜像）：
 
 ```
-server/src/main/resources/com/dragon/read/oversea/gp/
-├── lib/libmetasec_ml.so        # 签名核心库（必需）
-├── lib/libc++_shared.so        # C++ 运行时（必需）
-├── apk/<任意名>.apk            # 占位即可（实测纯签服务不需要真 APK，可放空文件）
-└── other/ms_16777218.bin       # 证书文件（可选，缺省时部分流程可能失败）
+data/                          ← 与环境变量 FQ_DATA_DIR 同级即可
+├── libmetasec_ml.so           # 必需
+├── libc++_shared.so           # 必需（arm64-v8a）
+├── base.apk                   # 占位即可（纯签名服务不需要真 APK，可放空文件）
+└── ms_16777218.bin            # 可选（运行时生成的证书文件，缺失时部分流程可能失败）
 ```
 
-> 路径常量在 `server/src/main/java/com/anjia/unidbgserver/unidbg/IdleFQ.java` 顶部，按需修改。
+**一键提取**（从你自己合法持有的 APK）：
+
+```bash
+./scripts/fetch-data.sh /path/to/你的番茄小说.apk
+```
+
+**目录查找顺序**（代码实现，见 `IdleFQ.dataDir()`）：
+
+1. 环境变量 `FQ_DATA_DIR` 指定的目录
+2. **jar 同级的 `data/`** ← 推荐
+3. 当前工作目录的 `data/`
+4. 都找不到 ⇒ 回退到 jar 内打包的资源
+
+> 也可用 `FQ_DATA_DIR=/somewhere/else` 指定任意位置。
 
 ## 快速开始
 
@@ -138,8 +151,10 @@ curl -X POST -H 'Content-Type: application/json' \
 
 ```
 server/    Java 服务源码（签名 + API）
-deploy/    Dockerfile / compose.yaml / entrypoint.sh
+deploy/    Dockerfile / compose.yaml / entrypoint.sh（compose 里已挂载 ./data）
 python/    纯 Python 参考实现（无需 JVM）
+scripts/   fetch-data.sh —— 从你自己的 APK 提取所需原生库到 ./data/
+data/      ← 你自己放官方库的地方（不进仓库）
 ```
 
 ## 纯 Python 参考实现（`python/`）
