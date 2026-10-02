@@ -18,7 +18,8 @@ for lib in libmetasec_ml.so libc++_shared.so; do
   if unzip -o -j "$APK" "lib/arm64-v8a/$lib" -d "$OUT" >/dev/null 2>&1; then
     echo "  ✓ $lib"
   else
-    echo "  ✗ 未在 APK 中找到 lib/arm64-v8a/$lib（可尝试 armeabi-v7a，但本项目按 arm64 64 位模拟）" >&2
+    echo "  ✗ 未在 APK 中找到 lib/arm64-v8a/$lib" >&2
+    echo "     注意：必须是【与代码匹配的版本】，否则签名入口偏移不同、无法工作" >&2
   fi
 done
 
@@ -26,9 +27,9 @@ done
 [ -s "$OUT/base.apk" ] || printf 'placeholder' > "$OUT/base.apk"
 echo "  ✓ base.apk（占位）"
 
-# ms_16777218.bin 是运行时生成的文件，一般不在 APK 里；缺失时部分流程可能失败
+# ms_16777218.bin 是上游 unidbg 项目随资源附带的数据文件，不在 APK 内
 echo
 echo "==> 完成："
 ls -la "$OUT"
 echo
-echo "提示：ms_16777218.bin 通常在设备数据目录（/data/data/<包名>/files/）里，按需自行拷贝。"
+echo "提示：ms_16777218.bin 属于第三方 unidbg 项目的附带资源，不在 APK 内，按需自行获取。"

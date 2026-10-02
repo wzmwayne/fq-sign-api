@@ -44,7 +44,7 @@ data/                          ← 与环境变量 FQ_DATA_DIR 同级即可
 ├── libmetasec_ml.so           # 必需
 ├── libc++_shared.so           # 必需（arm64-v8a）
 ├── base.apk                   # 占位即可（纯签名服务不需要真 APK，可放空文件）
-└── ms_16777218.bin            # 可选（运行时生成的证书文件，缺失时部分流程可能失败）
+└── ms_16777218.bin            # 可选（上游 unidbg 项目随资源附带的数据文件）
 ```
 
 **一键提取**（从你自己合法持有的 APK）：
@@ -61,6 +61,20 @@ data/                          ← 与环境变量 FQ_DATA_DIR 同级即可
 4. 都找不到 ⇒ 回退到 jar 内打包的资源
 
 > 也可用 `FQ_DATA_DIR=/somewhere/else` 指定任意位置。
+
+### ⚠️ 版本强绑定（最容易踩的坑）
+
+代码里**硬编码了与这份 `.so` 一一对应的常量**：
+
+- 包名 `PACKAGE_NAME = "com.dragon.read.oversea.gp"`
+- 签名入口偏移 `base + 0x168c80`
+- 本仓库验证通过的 `.so`：**3,447,432 字节，md5 `affd5bdfe377096a…`**（内部版本 v3.6.0）
+
+对应 App：**番茄小说「海外 Google Play 版」`com.dragon.read.oversea.gp` 6.8.1.32**
+
+> **换成其它版本（国内版 / 精简版 / 新版本）⇒ 入口偏移不同 ⇒ 大概率跑不通** ✗
+> 请使用**同版本**的 `libmetasec_ml.so` 与配套 `libc++_shared.so`；
+> 若版本不同，需要自行重新定位签名入口偏移（`0x168c80`）并相应修改代码。
 
 ## 快速开始
 
