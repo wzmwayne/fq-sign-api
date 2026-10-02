@@ -82,6 +82,197 @@ public class Main {
         } catch (Throwable ig) { /* 客户端可能已断开 */ }
     }
 
+    // ==================== 内置 API 文档（Markdown → HTML）====================
+    static final String API_DOC_MD = """
+# 番茄小说签名 API
+
+`POST /sign` —— 提交一个请求 URL，返回该请求所需的**全部 8 个签名头**：
+
+`X-Khronos` `X-Neptune` `X-Soter` `X-Ladon` `X-Argus` `X-Helios` `X-Gorgon` `X-Medusa`
+
+## 接口一览
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `POST` | `/sign` | 签名，返回 8 个头 |
+| `GET` | `/health` | 运行状态与计数 |
+| `GET` | `/` | 本页文档 |
+
+## POST /sign
+
+请求体可以直接是 URL：
+
+```bash
+curl -X POST -d 'https://api5-normal-sinfonlineb.fqnovel.com/reading/crypt/registerkey?aid=1967' \\
+     http://127.0.0.1:18090/sign
+```
+
+也可以是 JSON（`header` 为可选的自定义头）：
+
+```bash
+curl -X POST -H 'Content-Type: application/json' \\
+     -d '{"url":"https://...","header":""}' http://127.0.0.1:18090/sign
+```
+
+成功响应：
+
+```json
+{"ok":true,"headers":{"X-Argus":"...","X-Gorgon":"...","X-Helios":"...","X-Khronos":"...","X-Ladon":"...","X-Medusa":"...","X-Neptune":"...","X-Soter":"..."}}
+```
+
+## 状态码
+
+| 状态码 | 含义 | 响应 |
+|---|---|---|
+| `200` | 成功 | `{"ok":true,"headers":{...}}` |
+| `400` | 缺少 url | `{"ok":false,"error":"missing url"}` |
+| `429` | 单 IP 触发限速 | `{"ok":false,"error":"rate limited","retry_after":N}` + `Retry-After` 头 |
+| `503` | 队列已满（**立即**返回） | `{"ok":false,"error":"server overloaded","queue":20}` |
+| `500` | 内部错误 | `{"ok":false,"error":"internal"}` |
+
+## 限流与排队
+
+- **完全串行**：同一时刻只处理 1 个签名请求（匹配签名库的真实能力）
+- **有界排队**：最多排队 20 个，超出**立即**返回 `503`（实测 0.11~0.17s，不是等超时）
+- **单 IP 限速**：1 次 / 5 秒，触发返回 `429` + `Retry-After`
+- **防伪造 IP 头**：取**所有**候选来源（`CF-Connecting-IP`、`True-Client-IP`、`X-Real-IP`、
+  `X-Forwarded-For` 的每一跳、socket 对端），**任一个超限即拒绝**
+
+## 环境变量
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `FQ_MAX_QUEUE` | `20` | 排队上限 |
+| `FQ_PER_IP_MS` | `5000` | 单 IP 最小间隔（毫秒） |
+
+## GET /health
+
+```json
+{"status":"ok","inflight":0,"served":22,"rejected":10}
+```
+
+---
+
+仅供学习与安全研究使用；请遵守当地法律法规与目标服务条款。
+""";
+
+    static String htmlEsc(String s) {
+        return s == null ? "" : s.replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;").replace("\"", "&quot;");
+    }
+
+    static String mdInline(String s) {
+        s = htmlEsc(s);
+        s = s.replaceAll("`([^`]+)`", "<code>$1</code>");
+        s = s.replaceAll("\\*\\*([^*]+)\\*\\*", "<strong>$1</strong>");
+        s = s.replaceAll("\\[([^]]+)]\\(([^)]+)\\)", "<a href=\"$2\" target=\"_blank\" rel=\"noopener\">$1</a>");
+        return s;
+    }
+
+    static void mdFlush(StringBuilder o, java.util.List<String> para) {
+        if (para.isEmpty()) return;
+        StringBuilder p = new StringBuilder();
+        for (String s : para) { if (p.length() > 0) p.append(' '); p.append(s.trim()); }
+        o.append("<p>").append(mdInline(p.toString())).append("</p>\n");
+        para.clear();
+    }
+
+    /** 极简 Markdown 渲染：标题 / 代码块 / 表格 / 列表 / 引用 / 分割线 / 行内样式 */
+    static String mdToHtml(String md) {
+        StringBuilder o = new StringBuilder();
+        String[] ls = md.split("\n", -1);
+        boolean inCode = false;
+        StringBuilder code = new StringBuilder();
+        java.util.List<String> para = new java.util.ArrayList<>();
+        for (int i = 0; i < ls.length; i++) {
+            String l = ls[i];
+            if (l.startsWith("```")) {
+                if (!inCode) { inCode = true; code.setLength(0); }
+                else { inCode = false; o.append("<pre><code>").append(htmlEsc(code.toString())).append("</code></pre>\n"); }
+                continue;
+            }
+            if (inCode) { code.append(l).append('\n'); continue; }
+            if (l.isBlank()) { mdFlush(o, para); continue; }
+            if (l.startsWith("|")) {                                  // 表格
+                java.util.List<String> rows = new java.util.ArrayList<>();
+                int j = i;
+                while (j < ls.length && ls[j].startsWith("|")) { rows.add(ls[j]); j++; }
+                boolean hasHead = rows.size() > 1 && rows.get(1).matches("^\\|[\\s:\\-|]+\\|\\s*$");
+                o.append("<table>\n");
+                for (int r = 0; r < rows.size(); r++) {
+                    String row = rows.get(r);
+                    if (row.matches("^\\|[\\s:\\-|]+\\|\\s*$")) continue;
+                    o.append("<tr>");
+                    for (String c : row.replaceAll("^\\|", "").replaceAll("\\|\\s*$", "").split("\\|")) {
+                        boolean th = hasHead && r == 0;
+                        o.append(th ? "<th>" : "<td>").append(mdInline(c.trim())).append(th ? "</th>" : "</td>");
+                    }
+                    o.append("</tr>\n");
+                }
+                o.append("</table>\n");
+                i = j - 1;
+                continue;
+            }
+            int h = 0; while (h < l.length() && h < 7 && l.charAt(h) == '#') h++;
+            if (h > 0 && h < l.length() && l.charAt(h) == ' ') {       // 标题
+                mdFlush(o, para);
+                o.append("<h").append(h).append('>').append(mdInline(l.substring(h + 1)))
+                 .append("</h").append(h).append(">\n");
+                continue;
+            }
+            if (l.startsWith("---") || l.startsWith("***")) { mdFlush(o, para); o.append("<hr>\n"); continue; }
+            if (l.startsWith("> ")) { mdFlush(o, para); o.append("<blockquote>").append(mdInline(l.substring(2))).append("</blockquote>\n"); continue; }
+            if (l.startsWith("- ") || l.matches("^[0-9]+\\.[ ].*")) {  // 列表
+                mdFlush(o, para);
+                String t = l.startsWith("- ") ? l.substring(2) : l.replaceFirst("^[0-9]+\\.\\s+", "");
+                o.append("<ul><li>").append(mdInline(t)).append("</li></ul>\n");
+                continue;
+            }
+            para.add(l);
+        }
+        mdFlush(o, para);
+        return o.toString();
+    }
+
+    static final String DOC_CSS = """
+            :root{color-scheme:light dark}
+            body{margin:0;padding:2rem 1rem;font:16px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",
+                 "PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+                 background:#fafafa;color:#222}
+            main{max-width:860px;margin:0 auto;background:#fff;padding:2.5rem 3rem;border-radius:12px;
+                 box-shadow:0 1px 3px rgba(0,0,0,.08),0 8px 30px rgba(0,0,0,.04)}
+            h1{font-size:1.9rem;border-bottom:2px solid #eee;padding-bottom:.5rem;margin-top:0}
+            h2{font-size:1.35rem;margin-top:2rem;border-bottom:1px solid #f0f0f0;padding-bottom:.3rem}
+            code{background:#f2f3f5;padding:.15em .4em;border-radius:4px;
+                 font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.9em}
+            pre{background:#1e2127;color:#e6e6e6;padding:1rem 1.2rem;border-radius:8px;overflow-x:auto}
+            pre code{background:none;color:inherit;padding:0}
+            table{border-collapse:collapse;width:100%;margin:1rem 0}
+            th,td{border:1px solid #e5e7eb;padding:.5rem .75rem;text-align:left;vertical-align:top}
+            th{background:#f8f9fa;font-weight:600}
+            blockquote{margin:1rem 0;padding:.6rem 1rem;border-left:4px solid #d0d7de;
+                       background:#f6f8fa;color:#444;border-radius:0 6px 6px 0}
+            hr{border:none;border-top:1px solid #eee;margin:2rem 0}
+            a{color:#0969da}
+            ul{margin:.4rem 0;padding-left:1.4rem}
+            @media (prefers-color-scheme:dark){
+              body{background:#0d1117;color:#e6edf3}
+              main{background:#161b22;box-shadow:none}
+              code{background:#21262d}
+              th{background:#21262d} th,td{border-color:#30363d}
+              blockquote{background:#161b22;border-color:#30363d;color:#c9d1d9}
+              h1,h2{border-color:#30363d}
+            }
+            """;
+
+    static byte[] apiDocPage() {
+        String html = "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
+                + "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+                + "<title>番茄小说签名 API · 文档</title><style>" + DOC_CSS + "</style></head>"
+                + "<body><main>" + mdToHtml(API_DOC_MD) + "</main></body></html>";
+        return html.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    }
+
     /** 从请求体里取一个字符串字段（极简解析，够用即可） */
     static String jget(String body, String key) {
         int i = body.indexOf("\"" + key + "\"");
@@ -226,6 +417,14 @@ public class Main {
                 srv.createContext("/health", ex -> jresp(ex, 200,
                         "{\"status\":\"ok\",\"inflight\":" + inflight.get()
                                 + ",\"served\":" + served.get() + ",\"rejected\":" + rejected.get() + "}", null));
+
+                // 根路径 → 渲染后的 API 文档（HTML）
+                srv.createContext("/", ex -> {
+                    byte[] page = apiDocPage();
+                    ex.getResponseHeaders().add("Content-Type", "text/html; charset=utf-8");
+                    ex.sendResponseHeaders(200, page.length);
+                    try (java.io.OutputStream os = ex.getResponseBody()) { os.write(page); }
+                });
 
                 srv.createContext("/sign", ex -> {
                     try {

@@ -124,6 +124,14 @@ curl -X POST -H 'Content-Type: application/json' \
 | 503 | 队列已满（立即返回） | `{"ok":false,"error":"server overloaded","queue":20}` |
 | 500 | 内部错误 | `{"ok":false,"error":"internal"}` |
 
+### `GET /`
+
+直接访问根路径会返回**渲染后的 API 文档**（内置 Markdown → HTML，无外部依赖、无 CDN）：
+
+```bash
+curl http://127.0.0.1:18090/          # 浏览器打开亦可
+```
+
 ### `GET /health`
 
 ```json
