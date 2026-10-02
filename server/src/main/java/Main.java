@@ -86,74 +86,54 @@ public class Main {
     static final String API_DOC_MD = """
 # 番茄小说签名 API
 
-`POST /sign` —— 提交一个请求 URL，返回该请求所需的**全部 8 个签名头**：
+## 发什么
 
-`X-Khronos` `X-Neptune` `X-Soter` `X-Ladon` `X-Argus` `X-Helios` `X-Gorgon` `X-Medusa`
+`POST /sign`
 
-## 接口一览
-
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| `POST` | `/sign` | 签名，返回 8 个头 |
-| `GET` | `/health` | 运行状态与计数 |
-| `GET` | `/` | 本页文档 |
-
-## POST /sign
-
-请求体可以直接是 URL：
+**方式一**：请求体直接就是 URL（最简）
 
 ```bash
-curl -X POST -d 'https://api5-normal-sinfonlineb.fqnovel.com/reading/crypt/registerkey?aid=1967' \\
-     http://127.0.0.1:18090/sign
+curl -X POST -d 'https://api5-normal-sinfonlineb.fqnovel.com/reading/reader/batch_full/v1?iid=...&device_id=...&aid=1967' https://<你的域名>/sign
 ```
 
-也可以是 JSON（`header` 为可选的自定义头）：
-
-```bash
-curl -X POST -H 'Content-Type: application/json' \\
-     -d '{"url":"https://...","header":""}' http://127.0.0.1:18090/sign
-```
-
-成功响应：
+**方式二**：JSON（`header` 可选，用于附加自定义请求头）
 
 ```json
-{"ok":true,"headers":{"X-Argus":"...","X-Gorgon":"...","X-Helios":"...","X-Khronos":"...","X-Ladon":"...","X-Medusa":"...","X-Neptune":"...","X-Soter":"..."}}
+{"url": "https://api5-normal-sinfonlineb.fqnovel.com/reading/reader/batch_full/v1?...", "header": ""}
 ```
 
-## 状态码
+## 回什么
 
-| 状态码 | 含义 | 响应 |
-|---|---|---|
-| `200` | 成功 | `{"ok":true,"headers":{...}}` |
-| `400` | 缺少 url | `{"ok":false,"error":"missing url"}` |
-| `429` | 单 IP 触发限速 | `{"ok":false,"error":"rate limited","retry_after":N}` + `Retry-After` 头 |
-| `503` | 队列已满（**立即**返回） | `{"ok":false,"error":"server overloaded","queue":20}` |
-| `500` | 内部错误 | `{"ok":false,"error":"internal"}` |
-
-## 限流与排队
-
-- **完全串行**：同一时刻只处理 1 个签名请求（匹配签名库的真实能力）
-- **有界排队**：最多排队 20 个，超出**立即**返回 `503`（实测 0.11~0.17s，不是等超时）
-- **单 IP 限速**：1 次 / 5 秒，触发返回 `429` + `Retry-After`
-- **防伪造 IP 头**：取**所有**候选来源（`CF-Connecting-IP`、`True-Client-IP`、`X-Real-IP`、
-  `X-Forwarded-For` 的每一跳、socket 对端），**任一个超限即拒绝**
-
-## 环境变量
-
-| 变量 | 默认 | 说明 |
-|---|---|---|
-| `FQ_MAX_QUEUE` | `20` | 排队上限 |
-| `FQ_PER_IP_MS` | `5000` | 单 IP 最小间隔（毫秒） |
-
-## GET /health
+成功 `200`：
 
 ```json
-{"status":"ok","inflight":0,"served":22,"rejected":10}
+{
+  "ok": true,
+  "headers": {
+    "X-Argus":   "…",
+    "X-Gorgon":  "…",
+    "X-Helios":  "…",
+    "X-Khronos": "…",
+    "X-Ladon":   "…",
+    "X-Medusa":  "…",
+    "X-Neptune": "…",
+    "X-Soter":   "…"
+  }
+}
 ```
+
+失败：
+
+| 状态码 | 返回 |
+|---|---|
+| `400` | `{"ok":false,"error":"missing url"}` |
+| `429` | `{"ok":false,"error":"rate limited","retry_after":5}`  （并带 `Retry-After` 头） |
+| `503` | `{"ok":false,"error":"server overloaded","queue":20}` |
+| `500` | `{"ok":false,"error":"internal"}` |
 
 ---
 
-仅供学习与安全研究使用；请遵守当地法律法规与目标服务条款。
+仅供学习与安全研究使用。
 """;
 
     static String htmlEsc(String s) {
