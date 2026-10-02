@@ -52,7 +52,7 @@ data/                          ← 与环境变量 FQ_DATA_DIR 同级即可
 | 来源 | 链接 |
 |---|---|
 | gh-proxy CDN（推荐） | `https://cdn.gh-proxy.org/https://github.com/wzmwayne/github-webd/raw/refs/heads/main/webd/data.zip` |
-| 下载页（自有站点） | <https://wzml.cc.cd/github-webd/download.html?path=data.zip> |
+| 下载页 | <https://gzxz.us.ci/github-webd/download.html?path=data.zip> |
 | 蓝奏云 | <https://whdn.lanzouu.com/ipwKO4anf3qh> |
 
 - **校验**：`data.zip` = 1,522,880 字节，**md5 `2ed93c2e9aaea05e3942972feb749613`**
