@@ -49,10 +49,18 @@ data/                          ← 与环境变量 FQ_DATA_DIR 同级即可
 
 **方式 A：直接下载打包好的数据包（省事）**
 
-- 下载：<https://whdn.lanzouu.com/ipwKO4anf3qh> （蓝奏云，1.45 MB）
-- 校验：`data.zip` 的 **md5 = `2ed93c2e9aaea05e3942972feb749613`**
+| 来源 | 链接 |
+|---|---|
+| gh-proxy CDN（推荐） | `https://cdn.gh-proxy.org/https://github.com/wzmwayne/github-webd/raw/refs/heads/main/webd/data.zip` |
+| 下载页（自有站点） | <https://wzml.cc.cd/github-webd/download.html?path=data.zip> |
+| 蓝奏云 | <https://whdn.lanzouu.com/ipwKO4anf3qh> |
+
+- **校验**：`data.zip` = 1,522,880 字节，**md5 `2ed93c2e9aaea05e3942972feb749613`**
 - 包内结构就是上面那个 `data/`（含 `md5.txt` 可自查）；解压后与 `fq_download.jar`
   （或 `compose.yaml`）放在**同一级目录**即可 ✓
+- 上述 gh-proxy 链接已实测：下载 1,522,880 B，md5 一致，解包后 `md5sum -c` 全部通过 ✓
+
+> 若下载后 md5 不符，请换一个来源重下（不同节点的缓存可能有差异）。
 
 **方式 B：从自己的 APK 提取**（能确保版本匹配）
 
