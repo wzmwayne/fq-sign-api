@@ -1,0 +1,16 @@
+# 番茄签名 API：POST /sign → 返回全部 8 个签名头
+#   · 完全串行（禁止并行）+ 最多排队 20；超出立即 503
+#   · 单 IP 1 次/5 秒；IP 取【所有】来源头（防伪造）
+services:
+  fqsign:
+    build: .
+    image: fqsign:latest
+    container_name: fqsign
+    restart: unless-stopped
+    mem_limit: 320m
+    environment:
+      - TZ=Asia/Shanghai
+      - FQ_MAX_QUEUE=20      # 排队上限
+      - FQ_PER_IP_MS=5000    # 单 IP 间隔(毫秒)
+    ports:
+      - "127.0.0.1:18090:8090"

@@ -1,0 +1,75 @@
+buildscript {
+    repositories {
+        maven { url 'https://maven.aliyun.com/repository/public' }
+        maven { url 'https://maven.aliyun.com/repository/gradle-plugin' }
+        maven { url 'https://mirrors.cloud.tencent.com/nexus/repository/maven-public/' }
+    }
+}
+plugins {
+    id 'java'
+    id 'application'
+}
+
+application {
+    mainClass = 'Main'
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+jar {
+    archiveFileName = 'fq_download.jar'
+    manifest {
+        attributes 'Main-Class': 'Main'
+    }
+    from {
+        configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) }
+    }
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
+repositories {
+    // === 国内镜像（手动配置）：阿里 + 腾讯，jitpack 最后回退 ===
+    maven { url 'https://maven.aliyun.com/repository/public' }
+    maven { url 'https://maven.aliyun.com/repository/central' }
+    maven { url 'https://maven.aliyun.com/repository/gradle-plugin' }
+    maven { url 'https://mirrors.cloud.tencent.com/nexus/repository/maven-public/' }
+    maven { url 'https://jitpack.io' }
+}
+
+dependencies {
+    implementation fileTree(dir: 'libs', include: ['*.jar'])
+
+    implementation 'com.github.zhkl0228:unidbg-android:0.9.8'
+    implementation 'com.github.zhkl0228:unidbg-api:0.9.8'
+    implementation 'com.github.zhkl0228:unidbg-unicorn2:0.9.8'
+    implementation 'com.github.zhkl0228:unidbg-dynarmic:0.9.8'
+    implementation 'com.github.zhkl0228:capstone:3.1.8'
+    implementation 'com.github.zhkl0228:unicorn:1.0.14'
+    implementation 'com.github.zhkl0228:keystone:0.9.7'
+    implementation 'com.github.zhkl0228:demumble:1.0.4'
+
+    implementation 'net.java.dev.jna:jna:5.10.0'
+    implementation 'org.scijava:native-lib-loader:2.3.5'
+    implementation 'net.dongliu:apk-parser:2.6.10'
+    implementation 'org.apache.commons:commons-collections4:4.4'
+    implementation 'commons-codec:commons-codec:1.15'
+    implementation 'org.springframework:spring-core:5.3.15'
+    implementation 'org.springframework:spring-jcl:5.3.15'
+    implementation 'commons-io:commons-io:2.6'
+    implementation 'com.alibaba:fastjson:1.2.83'
+
+    implementation 'org.slf4j:slf4j-api:1.7.33'
+    implementation 'ch.qos.logback:logback-classic:1.2.10'
+    implementation 'ch.qos.logback:logback-core:1.2.10'
+
+
+}
+
+

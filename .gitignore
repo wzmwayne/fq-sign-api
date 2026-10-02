@@ -1,0 +1,21 @@
+# 构建产物
+build/
+.gradle/
+*.class
+*.jar
+*.log
+.idea/
+*.iml
+.vscode/
+out/
+
+# ★ 官方版权二进制：绝不入库（使用者自备）
+*.so
+*.apk
+*.bin
+src/main/resources/com/
+
+# 本地数据
+data/
+output/
+cache/
