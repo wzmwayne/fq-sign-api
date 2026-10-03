@@ -32,7 +32,11 @@ X-Argus     X-Helios    X-Gorgon   X-Medusa
 - **单 IP 限速** 1 次 / 5 秒 → 429 + `Retry-After`
 - **防伪造 IP 头**：取**所有**候选来源（`CF-Connecting-IP` / `True-Client-IP` / `X-Real-IP` /
   `X-Forwarded-For` 全部跳 / `CF-Pseudo-IPv4` / socket 对端），**任一个超限即拒绝**
-- `/health` 监控端点（`inflight` / `served` / `rejected`）
+- `/health` 监控端点（`inflight` / `served` / `rejected` / 池状态）
+- **设备池**：默认 5 台设备（`FQ_POOL_SIZE` 可调），**启动时全部重注册**；`/sign` 会把 URL 的
+  `iid`/`device_id`/`cdid` 改写成当前设备，并返回该设备的 4 位内部 id 与密钥
+- **异常反馈**：`POST /device/report {"id":"…"}` 删掉被风控的设备并**重新注册补足**
+  （**全局** 10 秒一次，`FQ_REPORT_MIN_MS` 可调）
 - 容器化部署（`deploy/` 下有 Dockerfile 与 compose）
 
 ## 准备工作：把官方库放到「服务端同目录的 data/」
@@ -141,16 +145,24 @@ curl -X POST -H 'Content-Type: application/json' \
   "headers": {
     "X-Argus": "…", "X-Gorgon": "…", "X-Helios": "…", "X-Khronos": "…",
     "X-Ladon": "…", "X-Medusa": "…", "X-Neptune": "…", "X-Soter": "…"
-  }
+  },
+  "device": "3489",
+  "key": "32 位解密密钥（与该设备一一对应）",
+  "url": "把 iid/device_id/cdid 换成该设备后的完整 URL",
+  "device_info": {"install_id": "…", "device_id": "…", "cdid": "…"}
 }
 ```
 
+> 服务端维护一个**设备池**（默认 5 台）。请用返回的 `url` + `headers` 发真实请求，并用 `key` 解密正文
+> （密钥与设备一一对应，用错解不开）。`device` 是内部 4 位 id，用于异常反馈。
+
 | 状态码 | 含义 | 响应 |
 |---|---|---|
-| 200 | 成功 | `{"ok":true,"headers":{…}}` |
+| 200 | 成功 | `{"ok":true,"headers":{…},"device":"…","key":"…","url":"…","device_info":{…}}` |
 | 400 | 缺 url | `{"ok":false,"error":"missing url"}` |
 | 429 | 触发单 IP 限速 | `{"ok":false,"error":"rate limited","retry_after":N,"ip":"…"}` + `Retry-After` |
 | 503 | 队列已满（立即返回） | `{"ok":false,"error":"server overloaded","queue":20}` |
+| 503 | 池内无可用设备 | `{"ok":false,"error":"no available device"}` |
 | 500 | 内部错误 | `{"ok":false,"error":"internal"}` |
 
 ### `GET /`
@@ -164,8 +176,34 @@ curl http://127.0.0.1:18090/          # 浏览器打开亦可
 ### `GET /health`
 
 ```json
-{"status":"ok","inflight":0,"served":22,"rejected":10}
+{"status":"ok","inflight":0,"served":22,"rejected":10,"device_registered":true,"pool":"5/5"}
 ```
+
+### `GET /device`
+
+列出池内设备（`id` / `install_id` / `device_id` / `cdid` / `ok` / `err` / `key_len`）：
+
+```json
+{"ok":true,"size":5,"available":"5/5","devices":[{"id":"3489","install_id":"…","device_id":"…","cdid":"…","ok":true,"err":"","key_len":32}]}
+```
+
+### `POST /device/report`
+
+**上报某台设备异常**：删除该设备并**重新注册**一台补足，维持池容量：
+
+```bash
+curl -X POST -H 'Content-Type: application/json' -d '{"id":"3489"}' http://127.0.0.1:18090/device/report
+```
+
+```json
+{"ok":true,"removed":"3489","added":"8188","added_ok":true,"added_err":"","pool":"5/5"}
+```
+
+- 触发时机：正文返回 `code=110`（ILLEGAL_ACCESS）/ `code=100`（FAST_REJECT），
+  或 **HTTP 200 但响应体为空**（番茄对正文的 IP 级风控表现），或收到 `503 no available device`。
+- **全局限流：默认 10 秒一次**（`FQ_REPORT_MIN_MS` 可调）；期间调用返回
+  `429 {"ok":false,"error":"report rate limited","retry_after":10}`。
+- 服务**启动时会把整池全部重注册**。
 
 ## 可调参数（环境变量）
 
@@ -173,6 +211,8 @@ curl http://127.0.0.1:18090/          # 浏览器打开亦可
 |---|---|---|
 | `FQ_MAX_QUEUE` | `20` | 最多排队多少个请求（超出立即 503） |
 | `FQ_PER_IP_MS` | `5000` | 单 IP 最小间隔（毫秒） |
+| `FQ_POOL_SIZE` | `5` | 设备池容量（启动时全部重注册） |
+| `FQ_REPORT_MIN_MS` | `10000` | `/device/report` 的**全局**最小间隔（毫秒） |
 
 ## 性能与资源（实测）
 
