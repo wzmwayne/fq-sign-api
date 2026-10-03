@@ -118,9 +118,16 @@ curl -X POST -d 'https://api5-normal-sinfonlineb.fqnovel.com/reading/reader/batc
     "X-Medusa":  "…",
     "X-Neptune": "…",
     "X-Soter":   "…"
-  }
+  },
+  "device": "3489",
+  "key": "32 位解密密钥（与该设备一一对应）",
+  "url": "把 iid/device_id/cdid 换成该设备后的完整 URL",
+  "device_info": {"install_id": "…", "device_id": "…", "cdid": "…"}
 }
 ```
+
+> 请用返回的 `url` + `headers` 发真实请求，并用 `key` 解密正文（密钥与设备一一对应，用错解不开）。
+> 服务端维护一个**设备池**（默认 5 台，`FQ_POOL_SIZE` 可调），每台有一个**内部 4 位 id** 用于异常反馈。
 
 失败：
 
@@ -129,7 +136,30 @@ curl -X POST -d 'https://api5-normal-sinfonlineb.fqnovel.com/reading/reader/batc
 | `400` | `{"ok":false,"error":"missing url"}` |
 | `429` | `{"ok":false,"error":"rate limited","retry_after":5}`  （并带 `Retry-After` 头） |
 | `503` | `{"ok":false,"error":"server overloaded","queue":20}` |
+| `503` | `{"ok":false,"error":"no available device"}`  （池内无可用设备） |
 | `500` | `{"ok":false,"error":"internal"}` |
+
+## 设备池
+
+`GET /device` → 列出池内设备：
+
+```json
+{"ok":true,"size":5,"available":"5/5","devices":[{"id":"3489","install_id":"…","device_id":"…","cdid":"…","ok":true,"err":"","key_len":32}]}
+```
+
+`POST /device/report` → 上报某台设备异常：**删除该设备并重新注册一台补足**，维持池容量：
+
+```bash
+curl -X POST -H 'Content-Type: application/json' -d '{"id":"3489"}' https://<你的域名>/device/report
+```
+
+```json
+{"ok":true,"removed":"3489","added":"8188","added_ok":true,"added_err":"","pool":"5/5"}
+```
+
+- 触发时机：正文返回 `code=110`（ILLEGAL_ACCESS）/ `code=100`（FAST_REJECT），或 **HTTP 200 但响应体为空**（番茄对正文的 IP 级风控表现），或收到 `503 no available device`。
+- **全局限流：默认 10 秒一次**（`FQ_REPORT_MIN_MS` 可调）；期间调用返回 `429 {"ok":false,"error":"report rate limited","retry_after":10}`。
+- 服务**启动时会把整池全部重注册**。
 
 ---
 
@@ -336,6 +366,152 @@ curl -X POST -d 'https://api5-normal-sinfonlineb.fqnovel.com/reading/reader/batc
     static String installId = "1571665370176443";
     static String deviceCdid = "4f8527b1-1d6d-492b-8af4-6ee6caa645c8";
 
+    // ==================== 设备池 ====================
+    // 池里每台设备有：对外可见的【内部 4 位 id】（供异常反馈接口回传）+ 番茄侧设备身份 + registerkey 密钥。
+    // /sign 挑一台可用设备，把 URL 里的 iid/device_id/cdid 重写成该设备，并把 id/设备参数/密钥一起返回；
+    // 调用方据此发起真实请求（密钥必须与设备一致才能解正文）。
+    static final class Dev {
+        final String id4, installId, deviceId, cdid, cookie, ua;
+        volatile String key = "";
+        volatile boolean ok = false;
+        volatile String err = "";
+        Dev(String id4, String installId, String deviceId, String cdid, String cookie, String ua) {
+            this.id4 = id4; this.installId = installId; this.deviceId = deviceId;
+            this.cdid = cdid; this.cookie = cookie; this.ua = ua;
+        }
+    }
+
+    static final java.util.List<Dev> DEV_POOL = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+    static final Object POOL_LOCK = new Object();
+    static final java.util.concurrent.atomic.AtomicInteger POOL_RR = new java.util.concurrent.atomic.AtomicInteger();
+    static final int POOL_SIZE = Math.max(1, Integer.parseInt(System.getenv().getOrDefault("FQ_POOL_SIZE", "5")));
+    /** 异常反馈接口的【全局】最小间隔：默认 10 秒，期间调用直接 429 */
+    static final long REPORT_MIN_INTERVAL_MS =
+            Math.max(0, Long.parseLong(System.getenv().getOrDefault("FQ_REPORT_MIN_MS", "10000")));
+    static final java.util.concurrent.atomic.AtomicLong LAST_REPORT_MS =
+            new java.util.concurrent.atomic.AtomicLong(0L);
+    static final java.util.Random POOL_RND = new java.util.Random();
+
+    /** n 位随机数字串（首位非 0） */
+    static String rndDigits(int n) {
+        StringBuilder b = new StringBuilder();
+        b.append((char) ('1' + POOL_RND.nextInt(9)));
+        for (int i = 1; i < n; i++) b.append((char) ('0' + POOL_RND.nextInt(10)));
+        return b.toString();
+    }
+
+    /** 造一台新设备（未注册）：内部 4 位 id 唯一；番茄身份 = 随机 16 位数字 + uuid cdid */
+    static Dev newDev(java.util.Set<String> usedId4) {
+        String id4;
+        do { id4 = rndDigits(4); } while (usedId4.contains(id4));
+        String iid = rndDigits(16), did = rndDigits(16);
+        String cdid = java.util.UUID.randomUUID().toString();
+        String cookie = "store-region=cn-zj; store-region-src=did; install_id=" + iid;
+        return new Dev(id4, iid, did, cdid, cookie, FQ_UA_BASE);
+    }
+
+    static java.util.Set<String> poolIds() {
+        java.util.Set<String> s = new java.util.HashSet<>();
+        synchronized (POOL_LOCK) { for (Dev d : DEV_POOL) s.add(d.id4); }
+        return s;
+    }
+
+    /** 注册（registerkey）一台设备；串行调用，失败只记 err 不抛 */
+    static void poolRegister(Dev d) {
+        long t0 = System.currentTimeMillis();
+        try {
+            String k = fetchDecryptKey(d);
+            d.key = k == null ? "" : k;
+            d.ok = !d.key.isEmpty();
+            d.err = d.ok ? "" : "empty key";
+        } catch (Throwable te) {
+            d.ok = false; d.key = ""; d.err = String.valueOf(te.getMessage());
+        }
+        System.out.println("[POOL]   设备 " + d.id4 + " (install_id=" + d.installId + ") "
+                + (d.ok ? "注册成功 key=" + d.key.length() + " 位" : "注册失败: " + d.err)
+                + " 用时 " + (System.currentTimeMillis() - t0) + "ms");
+    }
+
+    static String poolSummary() {
+        int okN = 0;
+        synchronized (POOL_LOCK) { for (Dev d : DEV_POOL) if (d.ok) okN++; }
+        return okN + "/" + DEV_POOL.size();
+    }
+
+    /** 启动时：重建整池并【全部重注册】 */
+    static void poolInit() {
+        synchronized (POOL_LOCK) {
+            DEV_POOL.clear();
+            java.util.Set<String> used = new java.util.HashSet<>();
+            for (int i = 0; i < POOL_SIZE; i++) DEV_POOL.add(newDev(used));
+        }
+        System.out.println("[POOL] 设备池初始化 " + POOL_SIZE + " 台，开始全部注册（串行，需要数个签名周期）...");
+        java.util.List<Dev> snap;
+        synchronized (POOL_LOCK) { snap = new java.util.ArrayList<>(DEV_POOL); }
+        for (Dev d : snap) poolRegister(d);
+        System.out.println("[POOL] 注册完成，可用 " + poolSummary());
+    }
+
+    /** 轮询取一台【可用】设备；全不可用返回 null */
+    static Dev poolNext() {
+        synchronized (POOL_LOCK) {
+            int n = DEV_POOL.size();
+            if (n == 0) return null;
+            for (int k = 0; k < n; k++) {
+                int i = Math.floorMod(POOL_RR.getAndIncrement(), n);
+                Dev d = DEV_POOL.get(i);
+                if (d.ok) return d;
+            }
+            return null;
+        }
+    }
+
+    /** 异常反馈：删掉该 id 对应设备并补一台新设备（返回新设备，由调用方在锁外注册） */
+    static Dev poolRemoveAndRefill(String id4) {
+        Dev fresh;
+        synchronized (POOL_LOCK) {
+            boolean found = false;
+            for (java.util.Iterator<Dev> it = DEV_POOL.iterator(); it.hasNext();) {
+                if (it.next().id4.equals(id4)) { it.remove(); found = true; break; }
+            }
+            if (!found) return null;
+            fresh = newDev(poolIds());
+            DEV_POOL.add(fresh);   // 先入池（ok=false，不会被 poolNext 选中），锁外再注册
+        }
+        return fresh;
+    }
+
+    static String poolJson() {
+        StringBuilder b = new StringBuilder("{\"ok\":true,\"size\":").append(DEV_POOL.size())
+                .append(",\"available\":\"").append(poolSummary()).append("\",\"devices\":[");
+        synchronized (POOL_LOCK) {
+            boolean first = true;
+            for (Dev d : DEV_POOL) {
+                if (!first) b.append(',');
+                first = false;
+                b.append("{\"id\":\"").append(jesc(d.id4))
+                 .append("\",\"install_id\":\"").append(jesc(d.installId))
+                 .append("\",\"device_id\":\"").append(jesc(d.deviceId))
+                 .append("\",\"cdid\":\"").append(jesc(d.cdid))
+                 .append("\",\"ok\":").append(d.ok)
+                 .append(",\"err\":\"").append(jesc(d.err))
+                 .append("\",\"key_len\":").append(d.key.length()).append('}');
+            }
+        }
+        return b.append("]}").toString();
+    }
+
+    /** 把 URL 查询串里的 iid / device_id / cdid 换成指定设备的（其它参数原样保留） */
+    static String rewriteUrlDevice(String url, Dev d) {
+        if (url == null) return null;
+        String u = url;
+        if (u.contains("iid="))       u = u.replaceAll("([?&])iid=[^&]*",       "$1iid=" + d.installId);
+        if (u.contains("device_id=")) u = u.replaceAll("([?&])device_id=[^&]*", "$1device_id=" + d.deviceId);
+        if (u.contains("cdid="))      u = u.replaceAll("([?&])cdid=[^&]*",      "$1cdid=" + d.cdid);
+        return u;
+    }
+    // ==================== /设备池 ====================
+
     static final String DIRECTORY_URL = "https://fanqienovel.com/api/reader/directory/detail";
     static final String SEARCH_URL = "https://novel.snssdk.com/api/novel/channel/homepage/search/search/v1/";
 
@@ -381,6 +557,17 @@ curl -X POST -d 'https://api5-normal-sinfonlineb.fqnovel.com/reading/reader/batc
 
                 System.out.println("[SERVE] 预热一次签名...");
                 try { getFqSig("https://api5-normal-sinfonlineb.fqnovel.com/reading/crypt/registerkey?aid=1967"); } catch (Throwable te) {}
+
+                // ── 启动时建立设备池，并【全部重注册】──
+                poolInit();
+                boolean regOk = false;
+                {
+                    Dev first = poolNext();
+                    if (first != null) { decryptKey = first.key; regOk = true; }
+                    System.out.println("[SERVE] 设备池可用 " + poolSummary()
+                            + (regOk ? "" : "  ⇒ 池内暂无注册成功的设备"));
+                }
+                final boolean REG_OK = regOk;
                 System.out.println("[SERVE] 策略: 完全串行(禁止并行) | 最多排队 " + MAX_QUEUE
                         + " 个 | 单 IP 间隔 " + PER_IP_MS + "ms | 超出立即 503");
 
@@ -396,7 +583,57 @@ curl -X POST -d 'https://api5-normal-sinfonlineb.fqnovel.com/reading/reader/batc
 
                 srv.createContext("/health", ex -> jresp(ex, 200,
                         "{\"status\":\"ok\",\"inflight\":" + inflight.get()
-                                + ",\"served\":" + served.get() + ",\"rejected\":" + rejected.get() + "}", null));
+                                + ",\"served\":" + served.get() + ",\"rejected\":" + rejected.get()
+                                + ",\"device_registered\":" + REG_OK
+                                + ",\"pool\":\"" + poolSummary() + "\"}", null));
+
+                // ── 设备池：查看（GET /device） / 异常反馈（POST /device/report）──
+                srv.createContext("/device", ex -> {
+                    try {
+                        String path = ex.getRequestURI().getPath();
+                        String method = ex.getRequestMethod();
+                        if ("GET".equalsIgnoreCase(method)) { jresp(ex, 200, poolJson(), null); return; }
+                        if (!"POST".equalsIgnoreCase(method)) {
+                            jresp(ex, 405, "{\"ok\":false,\"error\":\"use GET /device or POST /device/report\"}", null);
+                            return;
+                        }
+                        if (!path.endsWith("/report")) {
+                            jresp(ex, 404, "{\"ok\":false,\"error\":\"unknown path; POST /device/report\"}", null);
+                            return;
+                        }
+                        String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+                        String id = jget(body, "id");
+                        if (id == null) id = jget(body, "device");
+                        if (id == null || id.isBlank()) {
+                            jresp(ex, 400, "{\"ok\":false,\"error\":\"missing id\"}", null);
+                            return;
+                        }
+                        // 全局限流：默认 10 秒一次（总体），期间调用直接 429
+                        long now = System.currentTimeMillis();
+                        long prev = LAST_REPORT_MS.get();
+                        if (REPORT_MIN_INTERVAL_MS > 0 && prev > 0 && now - prev < REPORT_MIN_INTERVAL_MS) {
+                            long retry = Math.max(1, (REPORT_MIN_INTERVAL_MS - (now - prev) + 999) / 1000);
+                            jresp(ex, 429, "{\"ok\":false,\"error\":\"report rate limited\",\"retry_after\":"
+                                    + retry + "}", String.valueOf(retry));
+                            return;
+                        }
+                        LAST_REPORT_MS.set(now);
+                        Dev fresh = poolRemoveAndRefill(id);
+                        if (fresh == null) {
+                            jresp(ex, 404, "{\"ok\":false,\"error\":\"device not found\",\"id\":\"" + jesc(id) + "\"}", null);
+                            return;
+                        }
+                        poolRegister(fresh);   // 锁外注册新设备（串行占用签名器）
+                        jresp(ex, 200, "{\"ok\":true,\"removed\":\"" + jesc(id) + "\",\"added\":\""
+                                + jesc(fresh.id4) + "\",\"added_ok\":" + fresh.ok
+                                + ",\"added_err\":\"" + jesc(fresh.err)
+                                + "\",\"pool\":\"" + poolSummary() + "\"}", null);
+                    } catch (Throwable te) {
+                        jresp(ex, 500, "{\"ok\":false,\"error\":\"internal\"}", null);
+                    } finally {
+                        ex.close();
+                    }
+                });
 
                 // 根路径 → 渲染后的 API 文档（HTML）
                 srv.createContext("/", ex -> {
@@ -453,9 +690,22 @@ curl -X POST -d 'https://api5-normal-sinfonlineb.fqnovel.com/reading/reader/batc
                             // 4) 申请串行闸门 —— 这里就是"排队"
                             worker.acquire();
                             try {
-                                String sig = getFqSig(url);
+                                Dev dev = poolNext();
+                                if (dev == null) {
+                                    rejected.incrementAndGet();
+                                    jresp(ex, 503, "{\"ok\":false,\"error\":\"no available device\"}", "10");
+                                    return;
+                                }
+                                String signedUrl = rewriteUrlDevice(url, dev);
+                                String sig = getFqSig(signedUrl);
                                 served.incrementAndGet();
-                                jresp(ex, 200, "{\"ok\":true,\"headers\":" + sigToJson(sig) + "}", null);
+                                jresp(ex, 200, "{\"ok\":true,\"headers\":" + sigToJson(sig)
+                                        + ",\"device\":\"" + jesc(dev.id4) + "\""
+                                        + ",\"url\":\"" + jesc(signedUrl) + "\""
+                                        + ",\"key\":\"" + jesc(dev.key) + "\""
+                                        + ",\"device_info\":{\"install_id\":\"" + jesc(dev.installId)
+                                        + "\",\"device_id\":\"" + jesc(dev.deviceId)
+                                        + "\",\"cdid\":\"" + jesc(dev.cdid) + "\"}}", null);
                             } finally {
                                 worker.release();
                             }
@@ -657,14 +907,20 @@ curl -X POST -d 'https://api5-normal-sinfonlineb.fqnovel.com/reading/reader/batc
 
     // ── FQ signed API methods ─────────────────────────────
 
-    static String fetchDecryptKey() throws Exception {
+    static String fetchDecryptKey() throws Exception { return fetchDecryptKey(null); }
+
+    /** 用指定设备身份走 registerkey；null ⇒ 内置单设备 */
+    static String fetchDecryptKey(Dev d) throws Exception {
+        String did = d != null ? d.deviceId : deviceId;
+        String iid = d != null ? d.installId : installId;
+        String cid = d != null ? d.cdid : deviceCdid;
         FqVariable var = new FqVariable();
-        var.setServerDeviceId(deviceId);
-        var.setInstallId(installId);
-        var.setCdid(deviceCdid);
+        var.setServerDeviceId(did);
+        var.setInstallId(iid);
+        var.setCdid(cid);
         FqCrypto crypto = new FqCrypto(FqCrypto.REG_KEY);
         String encContent = crypto.newRegisterKeyContent(var.getServerDeviceId(), "0");
-        String url = FQ_BASE_URL + "/reading/crypt/registerkey" + buildFqQS();
+        String url = FQ_BASE_URL + "/reading/crypt/registerkey" + buildFqQS(buildFqParams(d));
         String sig = getFqSig(url);
         byte[] raw = fqHttpPost(url, sig, ("{\"content\":\"" + encContent + "\",\"keyver\":1}").getBytes(StandardCharsets.UTF_8));
         if (raw == null) throw new IOException("registerkey 返回空");
@@ -841,9 +1097,15 @@ curl -X POST -d 'https://api5-normal-sinfonlineb.fqnovel.com/reading/reader/batc
         return _sig;
     }
 
-    static Map<String, String> buildFqParams() {
+    static Map<String, String> buildFqParams() { return buildFqParams(null); }
+
+    /** 指定设备身份时用该设备；null ⇒ 内置单设备（CLI 路径沿用） */
+    static Map<String, String> buildFqParams(Dev d) {
+        String iid = d != null ? d.installId : installId;
+        String did = d != null ? d.deviceId : deviceId;
+        String cid = d != null ? d.cdid : deviceCdid;
         Map<String, String> p = new LinkedHashMap<>();
-        p.put("iid", installId); p.put("device_id", deviceId); p.put("ac", "wifi");
+        p.put("iid", iid); p.put("device_id", did); p.put("ac", "wifi");
         p.put("channel", "googleplay"); p.put("aid", "1967"); p.put("app_name", "novelapp");
         p.put("version_code", "68132"); p.put("version_name", "6.8.1.32");
         p.put("device_platform", "android"); p.put("os", "android"); p.put("ssmix", "a");
@@ -856,7 +1118,7 @@ curl -X POST -d 'https://api5-normal-sinfonlineb.fqnovel.com/reading/reader/batc
         p.put("pv_player", "68132"); p.put("compliance_status", "0");
         p.put("need_personal_recommend", "1"); p.put("player_so_load", "1");
         p.put("is_android_pad_screen", "0"); p.put("rom_version", "V291IR+release-keys");
-        p.put("cdid", deviceCdid);
+        p.put("cdid", cid);
         return p;
     }
 
@@ -873,9 +1135,12 @@ curl -X POST -d 'https://api5-normal-sinfonlineb.fqnovel.com/reading/reader/batc
         return sb.toString();
     }
 
-    static Map<String, String> buildFqHeaders() {
+    static Map<String, String> buildFqHeaders() { return buildFqHeaders(null); }
+
+    static Map<String, String> buildFqHeaders(Dev d) {
         Map<String, String> h = new LinkedHashMap<>();
-        h.put("Cookie", FQ_COOKIE); h.put("User-Agent", FQ_UA);
+        h.put("Cookie", d != null ? d.cookie : FQ_COOKIE);
+        h.put("User-Agent", d != null ? d.ua : FQ_UA);
         h.put("Accept", "application/json; charset=utf-8");
         h.put("Accept-Encoding", "gzip"); h.put("x-xs-from-web", "0");
         h.put("x-ss-req-ticket", String.valueOf(System.currentTimeMillis()));
