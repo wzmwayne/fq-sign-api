@@ -34,7 +34,9 @@ X-Argus     X-Helios    X-Gorgon   X-Medusa
   `X-Forwarded-For` 全部跳 / `CF-Pseudo-IPv4` / socket 对端），**任一个超限即拒绝**
 - `/health` 监控端点（`inflight` / `served` / `rejected` / 池状态）
 - **设备池**：默认 5 台设备（`FQ_POOL_SIZE` 可调），**启动时全部重注册**；`/sign` 会把 URL 的
-  `iid`/`device_id`/`cdid` 改写成当前设备，并返回该设备的 4 位内部 id 与密钥
+  `iid`/`device_id`/`cdid` 改写成当前设备，并返回该设备的 4 位内部 id、密钥、Cookie 与 UA
+- **入池 + 持久化**：`POST /device/add {"install_id":"…","device_id":"…"}` 把外部铸出的真实设备
+  入池并**落盘** `data/devices.json`（重启自动读回，内部 id 不变）
 - **异常反馈**：`POST /device/report {"id":"…"}` 删掉被风控的设备并**重新注册补足**
   （**全局** 10 秒一次，`FQ_REPORT_MIN_MS` 可调）
 - 容器化部署（`deploy/` 下有 Dockerfile 与 compose）
@@ -147,18 +149,26 @@ curl -X POST -H 'Content-Type: application/json' \
     "X-Ladon": "…", "X-Medusa": "…", "X-Neptune": "…", "X-Soter": "…"
   },
   "device": "3489",
-  "key": "32 位解密密钥（与该设备一一对应）",
+  "primary": false,
+  "key": "32 位解密密钥（启动时 registerkey 所得，可能已过期）",
+  "key_note": "解正文前请对同一 device 现取现用，勿直接拿这里的 key 解密",
   "url": "把 iid/device_id/cdid 换成该设备后的完整 URL",
-  "device_info": {"install_id": "…", "device_id": "…", "cdid": "…"}
+  "device_info": {"install_id": "…", "device_id": "…", "cdid": "…"},
+  "cookie": "与 url/签名一致的那台设备的 Cookie",
+  "ua": "与 url/签名一致的那台设备的 User-Agent"
 }
 ```
 
-> 服务端维护一个**设备池**（默认 5 台）。请用返回的 `url` + `headers` 发真实请求，并用 `key` 解密正文
-> （密钥与设备一一对应，用错解不开）。`device` 是内部 4 位 id，用于异常反馈。
+> 请用返回的 `url` + `headers` 发真实请求；**真实请求的 `Cookie`/`User-Agent` 也必须用返回的
+> `cookie`/`ua`**（三者与签名一致，否则番茄可能返回空体）。
+> 解密密钥请对返回的 `device_info.device_id` 单独请求 `registerkey` **现取现用**（密钥随注册
+> 轮换，`key` 字段仅供排查，可能已过期）。
+> `device` 是内部 4 位 id，用于固定设备 / 异常反馈；池中第 0 位是**主设备**（默认优先使用，
+> `primary:true`），可用 `{"url":"…","device":"<内部id>"}` 指定其它设备。
 
 | 状态码 | 含义 | 响应 |
 |---|---|---|
-| 200 | 成功 | `{"ok":true,"headers":{…},"device":"…","key":"…","url":"…","device_info":{…}}` |
+| 200 | 成功 | `{"ok":true,"headers":{…},"device":"…","primary":bool,"key":"…","key_note":"…","url":"…","device_info":{…},"cookie":"…","ua":"…"}` |
 | 400 | 缺 url | `{"ok":false,"error":"missing url"}` |
 | 429 | 触发单 IP 限速 | `{"ok":false,"error":"rate limited","retry_after":N,"ip":"…"}` + `Retry-After` |
 | 503 | 队列已满（立即返回） | `{"ok":false,"error":"server overloaded","queue":20}` |
@@ -187,6 +197,24 @@ curl http://127.0.0.1:18090/          # 浏览器打开亦可
 {"ok":true,"size":5,"available":"5/5","devices":[{"id":"3489","install_id":"…","device_id":"…","cdid":"…","ok":true,"err":"","key_len":32}]}
 ```
 
+### `POST /device/add`
+
+把**外部铸出的真实设备**加入池（幂等：同一 `device_id` 只入一次）。入池后立即注册、并把整池
+**落盘**到 `data/devices.json`（重启自动读回，内部 4 位 id 保持不变）：
+
+```bash
+curl -X POST -H 'Content-Type: application/json' \
+  -d '{"install_id":"269844490264140","device_id":"269844490260044","cdid":"297a35be-…"}' \
+  http://127.0.0.1:18090/device/add
+```
+
+```json
+{"ok":true,"existed":false,"id":"5852","registered":true,"err":"","pool":"6/6"}
+```
+
+- `cdid` / `cookie` / `ua` 可省略；缺省时按内置设备同款补齐（`cookie` 的 `install_id` 自动取该设备的值）。
+- 只有外部铸出的设备会落盘，随机占位设备不落盘（避免越滚越多）。
+
 ### `POST /device/report`
 
 **上报某台设备异常**：删除该设备并**重新注册**一台补足，维持池容量：
@@ -211,8 +239,9 @@ curl -X POST -H 'Content-Type: application/json' -d '{"id":"3489"}' http://127.0
 |---|---|---|
 | `FQ_MAX_QUEUE` | `20` | 最多排队多少个请求（超出立即 503） |
 | `FQ_PER_IP_MS` | `5000` | 单 IP 最小间隔（毫秒） |
-| `FQ_POOL_SIZE` | `5` | 设备池容量（启动时全部重注册） |
+| `FQ_POOL_SIZE` | `5` | 设备池初始容量（不足用随机设备占位） |
 | `FQ_REPORT_MIN_MS` | `10000` | `/device/report` 的**全局**最小间隔（毫秒） |
+| `FQ_DEVICES_FILE` | `data/devices.json` | 外部设备落盘位置（空串 = 关闭持久化） |
 
 ## 性能与资源（实测）
 

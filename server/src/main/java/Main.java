@@ -41,7 +41,7 @@ public class Main {
     static final String FQ_BASE_URL = "https://api5-normal-sinfonlineb.fqnovel.com";
     static final String FQ_UA_BASE = "com.dragon.read.oversea.gp/68132 (Linux; U; Android 10; zh_CN; OnePlus11; Build/V291IR;tt-ok/3.12.13.4-tiktok)";
     static String FQ_UA = FQ_UA_BASE;
-    static String FQ_COOKIE = "store-region=cn-zj; store-region-src=did; install_id=1571665370176443";
+    static String FQ_COOKIE = "store-region=cn-zj; store-region-src=did; install_id=933935730456617";
     static IdleFQ idleFQ;
 
     // ================= /sign 服务：准入控制状态 =================
@@ -120,14 +120,17 @@ curl -X POST -d 'https://api5-normal-sinfonlineb.fqnovel.com/reading/reader/batc
     "X-Soter":   "…"
   },
   "device": "3489",
-  "key": "32 位解密密钥（与该设备一一对应）",
+  "primary": false,
+  "key": "32 位解密密钥（启动时 registerkey 所得，可能已过期）",
+  "key_note": "解正文前请对同一 device 现取现用，勿直接拿这里的 key 解密",
   "url": "把 iid/device_id/cdid 换成该设备后的完整 URL",
   "device_info": {"install_id": "…", "device_id": "…", "cdid": "…"}
 }
 ```
 
-> 请用返回的 `url` + `headers` 发真实请求，并用 `key` 解密正文（密钥与设备一一对应，用错解不开）。
+> 请用返回的 `url` + `headers` 发真实请求；**解密密钥请对返回的 `device_info.device_id` 单独请求 `registerkey` 现取现用**（密钥随注册轮换，`key` 字段仅供排查，可能已过期）。
 > 服务端维护一个**设备池**（默认 5 台，`FQ_POOL_SIZE` 可调），每台有一个**内部 4 位 id** 用于异常反馈。
+> 池中第 0 位是**主设备**（默认优先使用，`primary:true`），可用 `{"device":"<内部id>"}` 指定其它设备。
 
 失败：
 
@@ -146,6 +149,20 @@ curl -X POST -d 'https://api5-normal-sinfonlineb.fqnovel.com/reading/reader/batc
 ```json
 {"ok":true,"size":5,"available":"5/5","devices":[{"id":"3489","install_id":"…","device_id":"…","cdid":"…","ok":true,"err":"","key_len":32}]}
 ```
+
+`POST /device/add` → 把**外部铸出的真实设备**加入池（幂等：同一 `device_id` 只入一次），入池后立即注册并**落盘** `data/devices.json`（重启自动读回）：
+
+```bash
+curl -X POST -H 'Content-Type: application/json' \
+  -d '{"install_id":"269844490264140","device_id":"269844490260044","cdid":"297a35be-d69a-4e4e-ba1f-3e0beff122f1"}' \
+  https://<你的域名>/device/add
+```
+
+```json
+{"ok":true,"existed":false,"id":"8188","registered":true,"err":"","pool":"6/6"}
+```
+
+> `cdid` / `cookie` / `ua` 可省略，缺省时按内置设备同款补齐（`cookie` 的 `install_id` 自动取该设备的值）。
 
 `POST /device/report` → 上报某台设备异常：**删除该设备并重新注册一台补足**，维持池容量：
 
@@ -362,9 +379,9 @@ curl -X POST -H 'Content-Type: application/json' -d '{"id":"3489"}' https://<你
     }
     static String decryptKey;
 
-    static String deviceId = "1571665370172347";
-    static String installId = "1571665370176443";
-    static String deviceCdid = "4f8527b1-1d6d-492b-8af4-6ee6caa645c8";
+    static String deviceId = "933935730452521";
+    static String installId = "933935730456617";
+    static String deviceCdid = "17f05006-423a-4172-be4b-7d26a42f2f4a";
 
     // ==================== 设备池 ====================
     // 池里每台设备有：对外可见的【内部 4 位 id】（供异常反馈接口回传）+ 番茄侧设备身份 + registerkey 密钥。
@@ -375,6 +392,8 @@ curl -X POST -H 'Content-Type: application/json' -d '{"id":"3489"}' https://<你
         volatile String key = "";
         volatile boolean ok = false;
         volatile String err = "";
+        /** true = 外部铸出的真实设备（才落盘）；随机占位设备为 false */
+        volatile boolean external = false;
         Dev(String id4, String installId, String deviceId, String cdid, String cookie, String ua) {
             this.id4 = id4; this.installId = installId; this.deviceId = deviceId;
             this.cdid = cdid; this.cookie = cookie; this.ua = ua;
@@ -391,6 +410,11 @@ curl -X POST -H 'Content-Type: application/json' -d '{"id":"3489"}' https://<你
     static final java.util.concurrent.atomic.AtomicLong LAST_REPORT_MS =
             new java.util.concurrent.atomic.AtomicLong(0L);
     static final java.util.Random POOL_RND = new java.util.Random();
+
+    /** 设备持久化文件：默认 data/devices.json（FQ_DEVICES_FILE 可覆盖，空串=关闭持久化） */
+    static final String DEVICES_FILE = System.getenv().getOrDefault("FQ_DEVICES_FILE", "data/devices.json");
+    /** 内置设备（代码常量）的固定内部 id；它不进持久化文件，启动时由常量重建 */
+    static final String BUILTIN_ID4 = "0001";
 
     /** n 位随机数字串（首位非 0） */
     static String rndDigits(int n) {
@@ -438,18 +462,44 @@ curl -X POST -H 'Content-Type: application/json' -d '{"id":"3489"}' https://<你
         return okN + "/" + DEV_POOL.size();
     }
 
-    /** 启动时：重建整池并【全部重注册】 */
+    /** 启动时：第 0 位放内置设备（默认优先使用），再读回持久化设备，不足 POOL_SIZE 用随机设备占位 */
     static void poolInit() {
         synchronized (POOL_LOCK) {
             DEV_POOL.clear();
-            java.util.Set<String> used = new java.util.HashSet<>();
-            for (int i = 0; i < POOL_SIZE; i++) DEV_POOL.add(newDev(used));
+            // 第 0 位 = 内置设备（来自代码常量），id4 固定为 0001，标记为 primary
+            DEV_POOL.add(new Dev(BUILTIN_ID4, installId, deviceId, deviceCdid, FQ_COOKIE, FQ_UA));
         }
-        System.out.println("[POOL] 设备池初始化 " + POOL_SIZE + " 台，开始全部注册（串行，需要数个签名周期）...");
+        int loaded = loadDevices();
+        synchronized (POOL_LOCK) {
+            java.util.Set<String> used = new java.util.HashSet<>();
+            for (Dev d : DEV_POOL) used.add(d.id4);
+            while (DEV_POOL.size() < POOL_SIZE) {   // 随机设备仅占位，多数注册不上
+                Dev nd = newDev(used);
+                used.add(nd.id4);
+                DEV_POOL.add(nd);
+            }
+        }
+        System.out.println("[POOL] 设备池初始化 " + DEV_POOL.size() + " 台（0001 = 内置设备 " + deviceId
+                + " 优先使用；持久化读回 " + loaded + " 台），全部注册...");
         java.util.List<Dev> snap;
         synchronized (POOL_LOCK) { snap = new java.util.ArrayList<>(DEV_POOL); }
         for (Dev d : snap) poolRegister(d);
         System.out.println("[POOL] 注册完成，可用 " + poolSummary());
+    }
+
+    /** 是否为池内【主设备】（第 0 位 = 内置设备，默认优先使用，不参与异常替换） */
+    static boolean poolIsPrimary(String id4) {
+        synchronized (POOL_LOCK) {
+            return !DEV_POOL.isEmpty() && DEV_POOL.get(0).id4.equals(id4);
+        }
+    }
+
+    /** 优先使用主设备；主设备不可用时退回任意可用设备 */
+    static Dev poolPrimary() {
+        synchronized (POOL_LOCK) {
+            if (!DEV_POOL.isEmpty() && DEV_POOL.get(0).ok) return DEV_POOL.get(0);
+        }
+        return poolNext();
     }
 
     /** 轮询取一台【可用】设备；全不可用返回 null */
@@ -466,6 +516,15 @@ curl -X POST -H 'Content-Type: application/json' -d '{"id":"3489"}' https://<你
         }
     }
 
+    /** 按内部 4 位 id 取设备（供客户端"固定一台设备"用）；不存在或不可用返回 null */
+    static Dev poolById(String id4) {
+        if (id4 == null || id4.isBlank()) return null;
+        synchronized (POOL_LOCK) {
+            for (Dev d : DEV_POOL) if (d.id4.equals(id4.trim())) return d.ok ? d : null;
+        }
+        return null;
+    }
+
     /** 异常反馈：删掉该 id 对应设备并补一台新设备（返回新设备，由调用方在锁外注册） */
     static Dev poolRemoveAndRefill(String id4) {
         Dev fresh;
@@ -479,6 +538,106 @@ curl -X POST -H 'Content-Type: application/json' -d '{"id":"3489"}' https://<你
             DEV_POOL.add(fresh);   // 先入池（ok=false，不会被 poolNext 选中），锁外再注册
         }
         return fresh;
+    }
+
+    /** 池内是否已有该番茄 device_id（用于 /device/add 幂等） */
+    static boolean poolHasDevice(String did) {
+        if (did == null) return false;
+        synchronized (POOL_LOCK) { for (Dev d : DEV_POOL) if (d.deviceId.equals(did.trim())) return true; }
+        return false;
+    }
+
+    /** 分配一个池内未占用的 4 位内部 id */
+    static String nextId4() {
+        synchronized (POOL_LOCK) {
+            java.util.Set<String> used = new java.util.HashSet<>();
+            for (Dev d : DEV_POOL) used.add(d.id4);
+            String id4;
+            do { id4 = rndDigits(4); } while (used.contains(id4));
+            return id4;
+        }
+    }
+
+    /**
+     * 把一台【外部铸出】的真实设备加入池（不注册）。device_id 已存在时直接返回池内那台。
+     * cdid/cookie/ua 缺省时按内置设备同款补齐（cookie 的 install_id 必须等于该设备 install_id）。
+     */
+    static Dev poolAdd(String iid, String did, String cid, String cookie, String ua) {
+        return poolAdd(iid, did, cid, cookie, ua, null);
+    }
+
+    /** id4 是否未被占用 */
+    static boolean id4Free(String id4) {
+        synchronized (POOL_LOCK) { for (Dev d : DEV_POOL) if (d.id4.equals(id4)) return false; }
+        return true;
+    }
+
+    static Dev poolAdd(String iid, String did, String cid, String cookie, String ua, String preferId4) {
+        did = did.trim();
+        synchronized (POOL_LOCK) {
+            for (Dev d : DEV_POOL) if (d.deviceId.equals(did)) return d;
+            if (cid == null || cid.isBlank()) cid = java.util.UUID.randomUUID().toString();
+            if (cookie == null || cookie.isBlank())
+                cookie = "store-region=cn-zj; store-region-src=did; install_id=" + iid.trim();
+            if (ua == null || ua.isBlank()) ua = FQ_UA_BASE;
+            String id4 = (preferId4 != null && !preferId4.isBlank() && id4Free(preferId4.trim()))
+                    ? preferId4.trim() : nextId4();
+            Dev d = new Dev(id4, iid.trim(), did, cid, cookie, ua);
+            d.external = true;
+            DEV_POOL.add(d);
+            return d;
+        }
+    }
+
+    /** 把池内【非内置】设备落盘（密钥不落盘，启动时统一重注册现取） */
+    static void saveDevices() {
+        if (DEVICES_FILE == null || DEVICES_FILE.isBlank()) return;
+        StringBuilder b = new StringBuilder("[\n");
+        synchronized (POOL_LOCK) {
+            boolean first = true;
+            for (Dev d : DEV_POOL) {
+                if (!d.external) continue;   // 只落盘铸出的真实设备，随机占位设备不落盘
+                if (!first) b.append(",\n");
+                first = false;
+                b.append("  {\"id\":\"").append(jesc(d.id4))
+                 .append("\",\"install_id\":\"").append(jesc(d.installId))
+                 .append("\",\"device_id\":\"").append(jesc(d.deviceId))
+                 .append("\",\"cdid\":\"").append(jesc(d.cdid))
+                 .append("\",\"cookie\":\"").append(jesc(d.cookie))
+                 .append("\",\"ua\":\"").append(jesc(d.ua)).append("\"}");
+            }
+        }
+        b.append("\n]\n");
+        try {
+            java.nio.file.Path p = java.nio.file.Path.of(DEVICES_FILE);
+            if (p.getParent() != null) java.nio.file.Files.createDirectories(p.getParent());
+            java.nio.file.Files.writeString(p, b.toString(), java.nio.charset.StandardCharsets.UTF_8);
+            System.out.println("[POOL] 已持久化设备 → " + p.toAbsolutePath());
+        } catch (Exception e) {
+            System.out.println("[POOL] 持久化失败 " + DEVICES_FILE + ": " + e.getMessage());
+        }
+    }
+
+    /** 启动时读回持久化设备；返回读到的条目数（内置设备已占 0001） */
+    static int loadDevices() {
+        if (DEVICES_FILE == null || DEVICES_FILE.isBlank()) return 0;
+        java.nio.file.Path p = java.nio.file.Path.of(DEVICES_FILE);
+        if (!java.nio.file.Files.isReadable(p)) return 0;
+        String txt;
+        try { txt = java.nio.file.Files.readString(p, java.nio.charset.StandardCharsets.UTF_8); }
+        catch (Exception e) { System.out.println("[POOL] 读设备文件失败: " + e.getMessage()); return 0; }
+        int n = 0, i = 0;
+        while ((i = txt.indexOf('{', i)) >= 0) {
+            int j = txt.indexOf('}', i);
+            if (j < 0) break;
+            String obj = txt.substring(i, j + 1);
+            i = j + 1;
+            String did = jget(obj, "device_id"), iid = jget(obj, "install_id");
+            if (did == null || did.isBlank() || iid == null || iid.isBlank()) continue;
+            poolAdd(iid, did, jget(obj, "cdid"), jget(obj, "cookie"), jget(obj, "ua"), jget(obj, "id"));
+            n++;
+        }
+        return n;
     }
 
     static String poolJson() {
@@ -594,11 +753,28 @@ curl -X POST -H 'Content-Type: application/json' -d '{"id":"3489"}' https://<你
                         String method = ex.getRequestMethod();
                         if ("GET".equalsIgnoreCase(method)) { jresp(ex, 200, poolJson(), null); return; }
                         if (!"POST".equalsIgnoreCase(method)) {
-                            jresp(ex, 405, "{\"ok\":false,\"error\":\"use GET /device or POST /device/report\"}", null);
+                            jresp(ex, 405, "{\"ok\":false,\"error\":\"use GET /device or POST /device/add|/device/report\"}", null);
+                            return;
+                        }
+                        // ── 入池：POST /device/add {install_id, device_id, cdid?, cookie?, ua?} ──
+                        if (path.endsWith("/add")) {
+                            String ab = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+                            String aiid = jget(ab, "install_id");
+                            String adid = jget(ab, "device_id");
+                            if (aiid == null || aiid.isBlank() || adid == null || adid.isBlank()) {
+                                jresp(ex, 400, "{\"ok\":false,\"error\":\"missing install_id/device_id\"}", null);
+                                return;
+                            }
+                            boolean existed = poolHasDevice(adid);
+                            Dev d = poolAdd(aiid, adid, jget(ab, "cdid"), jget(ab, "cookie"), jget(ab, "ua"));
+                            if (!existed) { poolRegister(d); saveDevices(); }
+                            jresp(ex, 200, "{\"ok\":true,\"existed\":" + existed + ",\"id\":\"" + jesc(d.id4)
+                                    + "\",\"registered\":" + d.ok + ",\"err\":\"" + jesc(d.err)
+                                    + "\",\"pool\":\"" + poolSummary() + "\"}", null);
                             return;
                         }
                         if (!path.endsWith("/report")) {
-                            jresp(ex, 404, "{\"ok\":false,\"error\":\"unknown path; POST /device/report\"}", null);
+                            jresp(ex, 404, "{\"ok\":false,\"error\":\"unknown path; POST /device/add|/device/report\"}", null);
                             return;
                         }
                         String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
@@ -606,6 +782,12 @@ curl -X POST -H 'Content-Type: application/json' -d '{"id":"3489"}' https://<你
                         if (id == null) id = jget(body, "device");
                         if (id == null || id.isBlank()) {
                             jresp(ex, 400, "{\"ok\":false,\"error\":\"missing id\"}", null);
+                            return;
+                        }
+                        // 主设备（内置设备，默认优先使用）不参与异常替换，避免把唯一可用设备换掉
+                        if (poolIsPrimary(id)) {
+                            jresp(ex, 409, "{\"ok\":false,\"error\":\"primary device protected\",\"id\":\""
+                                    + jesc(id) + "\"}", null);
                             return;
                         }
                         // 全局限流：默认 10 秒一次（总体），期间调用直接 429
@@ -624,6 +806,7 @@ curl -X POST -H 'Content-Type: application/json' -d '{"id":"3489"}' https://<你
                             return;
                         }
                         poolRegister(fresh);   // 锁外注册新设备（串行占用签名器）
+                        saveDevices();
                         jresp(ex, 200, "{\"ok\":true,\"removed\":\"" + jesc(id) + "\",\"added\":\""
                                 + jesc(fresh.id4) + "\",\"added_ok\":" + fresh.ok
                                 + ",\"added_err\":\"" + jesc(fresh.err)
@@ -690,22 +873,31 @@ curl -X POST -H 'Content-Type: application/json' -d '{"id":"3489"}' https://<你
                             // 4) 申请串行闸门 —— 这里就是"排队"
                             worker.acquire();
                             try {
-                                Dev dev = poolNext();
+                                Dev dev = poolPrimary();               // 默认优先用主设备（内置设备）
+                                String want = jget(body, "device");    // 调用方可指定池内某台设备
+                                if (want != null && !want.isBlank()) dev = poolById(want);
                                 if (dev == null) {
                                     rejected.incrementAndGet();
-                                    jresp(ex, 503, "{\"ok\":false,\"error\":\"no available device\"}", "10");
+                                    jresp(ex, 503, "{\"ok\":false,\"error\":\"no available device\""
+                                            + (want != null && !want.isBlank()
+                                               ? ",\"device\":\"" + jesc(want) + "\"" : "")
+                                            + "}", "5");
                                     return;
                                 }
                                 String signedUrl = rewriteUrlDevice(url, dev);
-                                String sig = getFqSig(signedUrl);
+                                String sig = getFqSig(signedUrl, dev);   // ★ 头里的 Cookie/UA 必须与 URL 的设备一致
                                 served.incrementAndGet();
                                 jresp(ex, 200, "{\"ok\":true,\"headers\":" + sigToJson(sig)
                                         + ",\"device\":\"" + jesc(dev.id4) + "\""
+                                        + ",\"primary\":" + poolIsPrimary(dev.id4)
                                         + ",\"url\":\"" + jesc(signedUrl) + "\""
                                         + ",\"key\":\"" + jesc(dev.key) + "\""
+                                        + ",\"key_note\":\"key 为服务端启动时 registerkey 所得，可能已过期；解正文前请对同一 device 现取现用\""
                                         + ",\"device_info\":{\"install_id\":\"" + jesc(dev.installId)
                                         + "\",\"device_id\":\"" + jesc(dev.deviceId)
-                                        + "\",\"cdid\":\"" + jesc(dev.cdid) + "\"}}", null);
+                                        + "\",\"cdid\":\"" + jesc(dev.cdid) + "\"}"
+                                        + ",\"cookie\":\"" + jesc(dev.cookie) + "\""
+                                        + ",\"ua\":\"" + jesc(dev.ua) + "\"}", null);
                             } finally {
                                 worker.release();
                             }
@@ -921,7 +1113,7 @@ curl -X POST -H 'Content-Type: application/json' -d '{"id":"3489"}' https://<你
         FqCrypto crypto = new FqCrypto(FqCrypto.REG_KEY);
         String encContent = crypto.newRegisterKeyContent(var.getServerDeviceId(), "0");
         String url = FQ_BASE_URL + "/reading/crypt/registerkey" + buildFqQS(buildFqParams(d));
-        String sig = getFqSig(url);
+        String sig = getFqSig(url, d);
         byte[] raw = fqHttpPost(url, sig, ("{\"content\":\"" + encContent + "\",\"keyver\":1}").getBytes(StandardCharsets.UTF_8));
         if (raw == null) throw new IOException("registerkey 返回空");
         String resp = tryGunzip(raw);
@@ -1077,8 +1269,15 @@ curl -X POST -H 'Content-Type: application/json' -d '{"id":"3489"}' https://<你
         return (HttpURLConnection) new URL(url).openConnection();
     }
 
-    static synchronized String getFqSig(String url) {
-        Map<String, String> h = buildFqHeaders();
+    static synchronized String getFqSig(String url) { return getFqSig(url, null); }
+
+    /**
+     * 带设备身份签名：签名器从【第二个参数（请求头文本）】里读取设备身份（Cookie 的 install_id / UA），
+     * 所以 URL 里的 iid/device_id/cdid 必须与这里的头一致，否则会被判 PARAM_INVALID / 空体。
+     * d == null 时沿用内置单设备（CLI 路径）。
+     */
+    static synchronized String getFqSig(String url, Dev d) {
+        Map<String, String> h = buildFqHeaders(d);
         StringBuilder sb = new StringBuilder();
         for (var e : h.entrySet())
             sb.append(e.getKey()).append("\r\n").append(e.getValue()).append("\r\n");
