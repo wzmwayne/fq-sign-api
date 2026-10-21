@@ -719,6 +719,7 @@ curl -X POST -H 'Content-Type: application/json' -d '{"id":"3489"}' https://<你
                 if (idleFQ == null) {
                     System.setErr(new PrintStream(new OutputStream() {public void write(int b){}}));
                     idleFQ = new IdleFQ(false);
+                    SIGNER_BORN_MS = System.currentTimeMillis();
                     System.setErr(System.err);
                 }
                 // ---- 准入控制参数（环境变量可覆盖）----
@@ -838,6 +839,23 @@ curl -X POST -H 'Content-Type: application/json' -d '{"id":"3489"}' https://<你
                     try (java.io.OutputStream os = ex.getResponseBody()) { os.write(page); }
                 });
 
+                // ── 手动重建签名器：调用方遇到正文 110 时可先试这个 ──
+                srv.createContext("/signer/recycle", ex -> {
+                    try {
+                        if (!"POST".equalsIgnoreCase(ex.getRequestMethod())) {
+                            jresp(ex, 405, "{\"ok\":false,\"error\":\"use POST\"}", null);
+                            return;
+                        }
+                        boolean ok = recycleSigner("/signer/recycle 手动触发");
+                        jresp(ex, 200, "{\"ok\":" + ok + ",\"sig_count\":" + SIG_COUNT.get()
+                                + ",\"recycle_after\":" + RECYCLE_AFTER + "}", null);
+                    } catch (Throwable te) {
+                        jresp(ex, 500, "{\"ok\":false,\"error\":\"internal\"}", null);
+                    } finally {
+                        ex.close();
+                    }
+                });
+
                 srv.createContext("/sign", ex -> {
                     try {
                         // 1) 先读 body、解析 url（不要占着排队名额等慢客户端）
@@ -936,6 +954,7 @@ curl -X POST -H 'Content-Type: application/json' -d '{"id":"3489"}' https://<你
                 if (idleFQ == null) {
                     System.setErr(new PrintStream(new OutputStream() {public void write(int b){}}));
                     idleFQ = new IdleFQ(false);
+                    SIGNER_BORN_MS = System.currentTimeMillis();
                     System.setErr(System.err);
                 }
                 String sg = getFqSig(u);
@@ -1283,6 +1302,28 @@ curl -X POST -H 'Content-Type: application/json' -d '{"id":"3489"}' https://<你
     }
 
     /** 最近一次签名实际使用的请求头（/sign 原样回传给调用方，避免客户端重算导致不一致） */
+    /** 签名器重建阈值：连续签名这么多次后重建，避免长时间使用后签名失效（表现为正文 110） */
+    static final int RECYCLE_AFTER =
+            Math.max(0, Integer.parseInt(System.getenv().getOrDefault("FQ_RECYCLE_AFTER", "200")));
+    /** 签名器最长存活时间：超过则重建（分钟，0=关闭） */
+    static final long RECYCLE_MAX_AGE_MS =
+            Math.max(0, Long.parseLong(System.getenv().getOrDefault("FQ_RECYCLE_MAX_AGE_MIN", "30"))) * 60_000L;
+    static volatile long SIGNER_BORN_MS = System.currentTimeMillis();
+    static final java.util.concurrent.atomic.AtomicInteger SIG_COUNT =
+            new java.util.concurrent.atomic.AtomicInteger();
+
+    /** 重建签名器（新 emulator + JNI_OnLoad）。返回是否真的重建了。 */
+    static synchronized boolean recycleSigner(String why) {
+        if (idleFQ == null) return false;
+        System.out.println("[SIGNER] 重建签名器（" + why + "）");
+        try { idleFQ.destroy(); } catch (Throwable ignored) {}
+        idleFQ = new IdleFQ(false);
+        SIG_COUNT.set(0);
+        SIGNER_BORN_MS = System.currentTimeMillis();
+        System.out.println("[SIGNER] 重建完成");
+        return true;
+    }
+
     static volatile Map<String, String> LAST_SIG_HEADERS = java.util.Collections.emptyMap();
 
     static synchronized String getFqSig(String url) { return getFqSig(url, null); }
@@ -1293,6 +1334,15 @@ curl -X POST -H 'Content-Type: application/json' -d '{"id":"3489"}' https://<你
      * d == null 时沿用内置单设备（CLI 路径）。
      */
     static synchronized String getFqSig(String url, Dev d) {
+        // 长时间连续签名会让 .so 内部状态漂移，签名被番茄判 ILLEGAL_ACCESS；
+        // 达到阈值就重建一次（代价 ~1s，远好于整池失效）
+        if (RECYCLE_AFTER > 0 && SIG_COUNT.get() >= RECYCLE_AFTER) {
+            recycleSigner("已签名 " + SIG_COUNT.get() + " 次");
+        } else if (RECYCLE_MAX_AGE_MS > 0 && SIGNER_BORN_MS > 0
+                && System.currentTimeMillis() - SIGNER_BORN_MS > RECYCLE_MAX_AGE_MS) {
+            recycleSigner("运行超过 " + (RECYCLE_MAX_AGE_MS / 60000) + " 分钟");
+        }
+        SIG_COUNT.incrementAndGet();
         Map<String, String> h = buildFqHeaders(d);
         LAST_SIG_HEADERS = h;   // 签名覆盖的就是这份头：调用方必须原样发送
         StringBuilder sb = new StringBuilder();

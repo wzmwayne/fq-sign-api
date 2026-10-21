@@ -254,8 +254,24 @@ curl -X POST -H 'Content-Type: application/json' -d '{"id":"3489"}' http://127.0
 - 正文签名走 `POST /sign`，首次返回后**固定同一台设备**（后续请求带 `device`），保证「设备 ↔ 签名 ↔ 密钥」一致
 - 解密密钥**现取现用**：用 `device_info.device_id` 调 `registerkey` 拿真实 key；`/sign` 的 `key` 可能已过期，仅作兜底
 - 正文 `code=110/100` 或 HTTP 200 空体 ⇒ `POST /device/report` 换一台设备重试一次（409 主设备受保护 / 429 限流 则记日志跳过）
-- 常用参数：`sign_url`、`ask_sign_node`（默认 `1`）、`group_size`（默认 50）、
+- **单批上限 30 章**：实测 `batch_full` 单次请求超过 30 章时，超出部分不返回正文；插件默认 `group_size=30`
+- 未取到的章节**先记录**，结束时汇总提示「共 N 章未下载」，并询问重试每批章数（默认 20；0 = 不重试按现状交付）
+- 常用参数：`sign_url`、`ask_sign_node`（默认 `1`）、`group_size`（默认 30）、
   `ask_over_chapters`（默认 150）、`auto_halve`（默认 `0`，开启后单批文本超 `batch_text_limit` 才自动折半）
+
+### `POST /signer/recycle`
+
+**重建签名器**（新 emulator + `JNI_OnLoad`），返回：
+
+```json
+{"ok":true,"sig_count":0,"recycle_after":200}
+```
+
+> 什么时候需要：签名器**长时间连续运行后签名会失效**——同一台设备、同一份头，
+> 正文开始返回 `{"code":110,"message":"ILLEGAL_ACCESS"}`，而重启服务/重建签名器后立刻恢复
+> （实测：重建前后同一请求 110 → `code:0`）。
+> 服务已按 `FQ_RECYCLE_AFTER`（默认 200 次）与 `FQ_RECYCLE_MAX_AGE_MIN`（默认 30 分钟）
+> **自动重建**；这个端点用于调用方遇到 110 时手动触发一次。
 
 ## 可调参数（环境变量）
 
@@ -266,6 +282,8 @@ curl -X POST -H 'Content-Type: application/json' -d '{"id":"3489"}' http://127.0
 | `FQ_POOL_SIZE` | `5` | 设备池初始容量（不足用随机设备占位） |
 | `FQ_REPORT_MIN_MS` | `10000` | `/device/report` 的**全局**最小间隔（毫秒） |
 | `FQ_DEVICES_FILE` | `data/devices.json` | 外部设备落盘位置（空串 = 关闭持久化） |
+| `FQ_RECYCLE_AFTER` | `200` | 连续签名多少次后重建签名器（0 = 关闭） |
+| `FQ_RECYCLE_MAX_AGE_MIN` | `30` | 签名器最长存活分钟数，超时重建（0 = 关闭） |
 
 ## 性能与资源（实测）
 

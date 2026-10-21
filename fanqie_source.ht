@@ -40,7 +40,8 @@
 //   start / end    下载章节范围（1 起、含端点；【都不传 = 下载全部章节】）
 //   max_chapters   最多下载多少章（默认 0 = 不限，即【全部】）
 //   batch          '1'/'true'（默认，批量接口）/ '0'/'false'（单章接口）
-//   group_size     批量接口每批章节数（默认 50；也是自适应拆分的上限）
+//   group_size     批量接口每批章节数（默认 30；实测单批超过 30 章时，超出部分服务端不返回正文，
+//                  会记入「未下载」并在结束时询问是否按更小批次重试）
 //   batch_text_limit  单批「解码后 JSON 字符数」上限（默认 400000）：仅在 auto_halve=1 时生效，
 //                  某批超过则自动折半重试，避免大报文在 isolate 里叠成内存峰值
 //   auto_halve     '1'/'true' 开启「超上限自动折半重试」；默认 '0'（关闭）：
@@ -830,6 +831,59 @@ var DL_TITLE = ''
 var DL_MISSING = []
 // 是否已交回结果：失败路径显式守卫，避免重复组装
 var DL_FINISHED = false
+// 未取到正文的章节（itemId 顺序记录；结束前汇总并向用户确认是否重试）
+var DL_MISSING_IDS = []
+var DL_MISSING_TITLES = {}
+var DL_RETRY_ASKED = false
+var DL_RETRY_MODE = false
+var DL_KEY_HEX = ''
+
+// 一批/一章跑完后的收口：
+// 1) 先把未取到正文的章节【记录下来】（不静默占位）；
+// 2) 全部跑完时汇总「共 N 章未下载」，问用户重试的每批章数（默认 20；0 = 不重试）；
+// 3) 重试只针对缺失章节，重试后不再重复询问，最后按 DL_SELECTED 完整组装。
+function batchesDone(contents) {
+  if (DL_RETRY_MODE) {
+    if (DL_MISSING_IDS.length > 0) {
+      log("重试后仍有 ${DL_MISSING_IDS.length} 章未取到正文，按现状交付（这些章节留空）")
+    } else {
+      log("重试完成：全部章节均已取到正文")
+    }
+    assemble(DL_SELECTED, contents)
+    return
+  }
+  if (DL_MISSING_IDS.length == 0) {
+    assemble(DL_SELECTED, contents)
+    return
+  }
+  DL_RETRY_ASKED = true
+  var total = DL_MISSING_IDS.length
+  log("本次共 ${total} 章未下载成功（服务端未返回正文）")
+  ask("本次共 ${total} 章未能下载。\n输入重试时每批的章数（默认 20；输入 0 = 不重试，按现状交付）", {'default': '20'}).then((reply) {
+    var ans = ''
+    if (reply['ok']) { ans = cleanText("${reply['answer']}", [['^\\s+', ''], ['\\s+$', '']]) }
+    var size = 20
+    if (ans != '') { size = parseInt10(ans, 20) }
+    if (size <= 0) {
+      log("按用户选择不重试：${total} 章留空，按现状交回")
+      assemble(DL_SELECTED, contents)
+    } else {
+      var retrySel = []
+      for (var i = 0; i < DL_MISSING_IDS.length; i = i + 1) {
+        var id = DL_MISSING_IDS[i]
+        var e = {}
+        e['id'] = id
+        e['title'] = DL_MISSING_TITLES[id] == null ? '' : DL_MISSING_TITLES[id]
+        retrySel.add(e)
+      }
+      DL_MISSING_IDS = []
+      DL_MISSING_TITLES = {}
+      DL_RETRY_MODE = true
+      log("开始重试 ${retrySel.length} 章，每批 ${size} 章")
+      fetchBatches(DL_BOOK_ID, retrySel, DL_KEY_HEX, 0, size, contents)
+    }
+  })
+}
 
 function assemble(selected, contents) {
   var chapters = []
@@ -877,7 +931,9 @@ function finishPartial(selected, contents, reason, rangeLabel) {
     DL_MISSING.add(rangeLabel)
     log("缺失范围：${rangeLabel}；已取到的章节照常交回，不丢弃进度")
   }
-  assemble(selected, contents)
+  // ★ 必须按完整目录组装：重试阶段传进来的 selected 只是缺失子集，
+  //   若直接用它 assemble，会把整本结果缩成这几十章。
+  assemble(DL_SELECTED, contents)
 }
 
 // 批量接口：递归取每批（≤group_size 章），成功后组装
@@ -886,7 +942,7 @@ function finishPartial(selected, contents, reason, rangeLabel) {
 // - 解码后文本超过 BATCH_TEXT_LIMIT 时把该批折半重试，降低内存峰值
 function fetchBatches(bookId, selected, keyHex, from, size, contents) {
   if (from >= selected.length) {
-    assemble(selected, contents)
+    batchesDone(contents)
   } else {
     var to = from + size
     if (to > selected.length) { to = selected.length }
@@ -979,12 +1035,16 @@ function fetchBatches(bookId, selected, keyHex, from, size, contents) {
                         }
                       } else {
                         noContent = noContent + 1
+                        DL_MISSING_IDS.add(itemId)
+                        DL_MISSING_TITLES[itemId] = selected[k]['title']
                         if (sample == '' && item != null) {
                           sample = "itemId=${itemId} code=${item['code']} code_i32=${item['code_i32']}"
                         }
                       }
                     } else {
                       noContent = noContent + 1
+                      DL_MISSING_IDS.add(itemId)
+                      DL_MISSING_TITLES[itemId] = selected[k]['title']
                     }
                     contents[itemId] = text
                   }
@@ -1006,7 +1066,7 @@ function fetchBatches(bookId, selected, keyHex, from, size, contents) {
 // 单章接口：递归逐章取（同样用 /sign 返回的 url+key，失败上报换设备一次、只标缺失不丢进度）
 function fetchSingles(bookId, selected, keyHex, index, contents) {
   if (index >= selected.length) {
-    assemble(selected, contents)
+    batchesDone(contents)
   } else {
     var itemId = selected[index]['id']
     var chRange = "第 ${index + 1} 章"
@@ -1066,10 +1126,14 @@ function fetchSingles(bookId, selected, keyHex, index, contents) {
                       text = cleanBody(decryptContent("${item['content']}", envKey))
                     }
                   } else {
-                    log("本章无正文（服务端未返回 content），已按空正文占位：itemId=${itemId}")
+                    log("本章无正文（服务端未返回 content）：itemId=${itemId}")
+                    DL_MISSING_IDS.add(itemId)
+                    DL_MISSING_TITLES[itemId] = selected[index]['title']
                   }
                 } else {
-                  log("本章响应 data 为空，已按空正文占位：itemId=${itemId}")
+                  log("本章响应 data 为空：itemId=${itemId}")
+                  DL_MISSING_IDS.add(itemId)
+                  DL_MISSING_TITLES[itemId] = selected[index]['title']
                 }
                 contents[itemId] = text
                 log("第 ${index + 1}/${selected.length} 章完成（正文 ${text.length} 字符）")
@@ -1087,8 +1151,11 @@ function fetchSingles(bookId, selected, keyHex, index, contents) {
 function startContentDownload(bookId, selected, keyHex, useBatch) {
   log('解密密钥已就绪')
   var contents = {}
+  DL_KEY_HEX = keyHex
+  DL_MISSING_IDS = []
+  DL_MISSING_TITLES = {}
   if (useBatch) {
-    fetchBatches(bookId, selected, keyHex, 0, parseInt10(param('group_size', '50'), 50), contents)
+    fetchBatches(bookId, selected, keyHex, 0, parseInt10(param('group_size', '30'), 30), contents)
   } else {
     fetchSingles(bookId, selected, keyHex, 0, contents)
   }
@@ -1279,8 +1346,46 @@ function failOp(op, reason) {
 // 2) 否则本次还没手动换过签名地址 ⇒ 问一次是否换签名地址（明文；取消/无界面=不换）；
 // 3) 都不行 ⇒ 交回已取到的部分章节（failOp），绝不丢进度。
 // 触发：正文 code=110/100、HTTP 200 空体/非 JSON；/sign 非 200 时若带 device 也走上报。
+// 遇到正文失败：先怀疑「服务端签名器长时间运行后失效」（实测重启签名器即恢复），
+// 所以第一步请求一次重建，成功就重试；不可用再回退到换设备/换地址流程。
+var signerRecycled = false
+
+function signerRecycleUrl() {
+  var base = cleanText("${signUrl}", [['/sign$', '']])
+  if (base == '') { return signUrl }
+  return base + '/signer/recycle'
+}
+
 function handleDownloadFailure(op, reason, device) {
   log("【下载失败】阶段=${op['kind']} device=${device} 原因：${reason}")
+  if (!signerRecycled) {
+    signerRecycled = true
+    var url = signerRecycleUrl()
+    log("请求重建服务端签名器：POST ${url}")
+    logReq('重建签名器', 'POST', url)
+    httpRequest({'url': url, 'method': 'POST'}).then((r) {
+      logResp('重建签名器', r)
+      var okFlag = false
+      if (r['status'] == 200 && looksJson(r['text'])) {
+        var root = JSON.parse(r['text'])
+        okFlag = (root != null && root['ok'] == true)
+      }
+      if (okFlag) {
+        poolDevice = ''
+        poolDeviceId = ''
+        log("签名器已重建，重试本次请求")
+        retryDownloadOp(op)
+      } else {
+        log("重建签名器不可用（HTTP ${r['status']}），回退到换设备/换地址流程")
+        continueFailureHandling(op, reason, device)
+      }
+    })
+  } else {
+    continueFailureHandling(op, reason, device)
+  }
+}
+
+function continueFailureHandling(op, reason, device) {
   if (device != '' && !deviceReported) {
     deviceReported = true
     var rurl = deviceReportUrl()
@@ -1521,7 +1626,7 @@ function runDownload() {
     var useBatch = true
     if (b == '0' || b == 'false' || b == 'no' || b == 'False') { useBatch = false }
     var dirUrl = param('directory_url', DIRECTORY_URL + '?bookId=' + bookId)
-    var gs = param('group_size', '50')
+    var gs = param('group_size', '30')
     var th = param('ask_over_chapters', '150')
     log('[参数] id=${bookId} start=${start} end=${end} max_chapters=${maxCh} batch=${useBatch} group_size=${gs} ask_over_chapters=${th} auto_halve=${AUTO_HALVE} sign_url=${signUrl} api_base=${apiBase}')
     askSignNodeThenDownload(bookId, start, end, maxCh, useBatch, dirUrl)
