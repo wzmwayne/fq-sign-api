@@ -1,0 +1,1312 @@
+// @script kind=source name="番茄小说"
+// 说明：番茄小说（fanqie）书源脚本，移植自 pyclient/fqclient.py + Main.java/FqCrypto.java。
+//
+// 契约（阅读 readerplus 最新，**没有独立的 detail 任务**，只有 search / download）：
+//   search   -> result({'items': [{'id','title','author','cover','intro','description'}, ...]})
+//               六字段齐全，id 必填，cover 没有给空字符串
+//               开启 cover_inline 时额外内联 coverData（裸 base64）
+//   download -> result({'id','chapters': [{'title','body'}, ...],
+//                       'author','cover','coverData'})
+//               download 可补充 author（优先于搜索结果）与封面：
+//                 coverData(裸 base64) > cover(URL)。封面字节由脚本用 wantBytes
+//                 自己抓（带 Referer 破 CDN 防盗链），失败/过大静默降级只交 cover URL。
+//               body = 正文明文；应用**不会**把 author 传进 download，
+//               故脚本在此阶段自己取一次书籍详情页拿作者/封面（失败静默留空）
+//               任何一批失败都不丢弃已取到的章节：照常交回部分结果，并在日志与
+//               payload['missing'] 里说明缺失范围（不再整体 result 空 chapters）。
+//               crypt_status：0 => content 是 base64 密文，走 AES+gzip 解密；
+//                             1/2 => content 已是明文，直接清洗。
+//               签名服务新契约（download 正文）：POST /sign（body=完整 URL，纯文本）返回
+//                 {headers, url, key, device, device_info, cookie, ua, primary}
+//               真实请求必须用返回的 url + headers + cookie + ua；首次 /sign 后固化 device，
+//               后续 /sign 用 body={"url":…,"device":"…"} 固定同一台（设备↔签名一致）。
+//               解密密钥【现取现用】：用 device_info.device_id 调 registerkey 拿真实 key；
+//               /sign 的 key 是启动时注册所得、可能已过期，仅在 registerkey 失败时兜底。
+//               正文 code=110/100 或 HTTP 200 空体 ⇒ POST <sign根>/device/report 后重试一次；
+//               上报 409（主设备受保护）/ 429（限流）⇒ 记日志跳过，不循环。
+//   detail   -> 保留仅为向后兼容，不再被应用调用；逻辑已抽成 bookMetaFromData
+//
+// 参数（均可用 param 覆盖）：
+//   task           search / download（宿主注入；detail 仅向后兼容，应用不再调用）
+//   query          搜索关键词（search）
+//   cover_inline   '1'/'true'（默认，搜索时把每条封面字节内联为 coverData）/ '0'/'false' 关闭
+//   id             书籍 book_id（detail / download）
+//   page           页码（search，当前仅支持第 1 页）
+//   detail_url     书籍详情页（download，默认 https://fanqienovel.com/page/<id>）
+//   start / end    下载章节范围（1 起、含端点；【都不传 = 下载全部章节】）
+//   max_chapters   最多下载多少章（默认 0 = 不限，即【全部】）
+//   batch          '1'/'true'（默认，批量接口）/ '0'/'false'（单章接口）
+//   group_size     批量接口每批章节数（默认 50；也是自适应拆分的上限）
+//   batch_text_limit  单批「解码后 JSON 字符数」上限（默认 400000）：仅在 auto_halve=1 时生效，
+//                  某批超过则自动折半重试，避免大报文在 isolate 里叠成内存峰值
+//   auto_halve     '1'/'true' 开启「超上限自动折半重试」；默认 '0'（关闭）：
+//                  超过 batch_text_limit 只记一条日志，仍按原批解析，不改变每批章数
+//   ask_over_chapters  超长书下载前「确认范围」的章数阈值（默认 150；0 = 关闭此提问）
+//                  仅当未显式给 end/max_chapters 且目录章数 > 该值时问一次：
+//                  全书 N 章。直接下载全部？也可输入范围：1-20 / 20 / 全部（留空=全部）
+//                  回答 空/全部/all = 全部；a-b = 区间；n = 前 n 章；无法解析 = 全部并 log；
+//                  取消/无界面 = 静默按全部继续（绝不失败）。
+//   sign_url       签名服务，默认 https://fq.gzxz.us.ci/sign（可改 http://127.0.0.1:8090/sign）
+//                  /sign 非 200 / 非 JSON 等失败时最多问一次是否换此地址，
+//                  回答非空则换 URL 重试一次；取消/无界面/已问过 => 按失败路径交回已取到的章节
+//   ask_sign_node  download 最开始是否询问「使用哪个签名节点」（默认 '1'；'0'/'false' 关闭）
+//                  问一次，回答归一化后改写 sign_url（回答 > sign_url 参数 > 默认值）；
+//                  空 => 默认 https://fq.gzxz.us.ci/sign；无 scheme 补 https://，缺 /sign 补 /sign；
+//                  取消/无界面 => 保持原 sign_url 继续，绝不失败。仅 download；search 不提问。
+//   api_base       番茄内容 API 根，默认 https://api5-normal-sinfonlineb.fqnovel.com
+//   directory_url  目录地址，默认 https://fanqienovel.com/api/reader/directory/detail?bookId=<id>
+//   device_id / install_id / cdid  设备参数（默认沿用 fqclient.py 的取值）
+//   rticket        _rticket / 时间戳头，默认 '0'（实测番茄不校验；当前设备已被风控，
+//                  如需新设备可传当前毫秒值）
+//
+// 注意：Hetu 无时钟、无 try/catch，因此：
+//   - 所有异步分支都必须自己调用 result()，绝不 throw；
+//   - API 错误码通过 log() 输出可读信息，并交回空结构。
+
+var task = param('task', 'search')
+var signUrl = param('sign_url', 'https://fq.gzxz.us.ci/sign')
+// 签名/风控失败只在本次运行里问一次、最多换 URL 重试一次（一次性开关）
+var signAsked = false
+// 是否已向服务端上报失效设备并换设备重试一次（每次运行只做一次，防死循环）
+var deviceReported = false
+// 本次运行固定的池内设备（/sign 首次返回后固化；后续 /sign 带 device 固定，保证 设备↔密钥↔签名 一致）
+var poolDevice = ''
+// 该设备的 device_info.device_id（registerkey 请求体必须用它，否则 verify fail）
+var poolDeviceId = ''
+var apiBase = param('api_base', 'https://api5-normal-sinfonlineb.fqnovel.com')
+var deviceId = param('device_id', '1571665370172347')
+var installId = param('install_id', '1571665370176443')
+var cdid = param('cdid', '4f8527b1-1d6d-492b-8af4-6ee6caa645c8')
+var rticket = param('rticket', '0')
+
+var REG_KEY = 'ac25c67ddd8f38c1b37a2348828e222e'
+var SEARCH_URL = 'https://novel.snssdk.com/api/novel/channel/homepage/search/search/v1/'
+var DIRECTORY_URL = 'https://fanqienovel.com/api/reader/directory/detail'
+var FQ_UA = 'com.dragon.read.oversea.gp/68132 (Linux; U; Android 10; zh_CN; OnePlus11; Build/V291IR;tt-ok/3.12.13.4-tiktok)'
+var WEB_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+var SIG_KEYS = ['X-Argus', 'X-Gorgon', 'X-Helios', 'X-Khronos', 'X-Ladon', 'X-Medusa', 'X-Neptune', 'X-Soter']
+// 封面内联上限：番茄封面多为 100~300KB；>1MB 放弃内联，避免把结果撑爆
+var COVER_MAX_BYTES = 1048576
+// 单批「解码后 JSON 字符数」上限：仅当 auto_halve 打开时用于触发折半重试（此时尚未 JSON.parse）
+var BATCH_TEXT_LIMIT = parseInt(param('batch_text_limit', '400000'))
+if (BATCH_TEXT_LIMIT == null || BATCH_TEXT_LIMIT < 0) { BATCH_TEXT_LIMIT = 400000 }
+// 是否允许「超上限自动折半重试」：默认关闭（'0'）；需要时传 auto_halve=1 / true 打开
+var AUTO_HALVE_RAW = param('auto_halve', '0')
+var AUTO_HALVE = false
+if (AUTO_HALVE_RAW == '1' || AUTO_HALVE_RAW == 'true' || AUTO_HALVE_RAW == 'yes' || AUTO_HALVE_RAW == 'True') {
+  AUTO_HALVE = true
+}
+
+// ------------------------- 工具函数 -------------------------
+
+// 封面 CDN（byteimg/bytecdn）有防盗链：带浏览器 UA + 书籍页 Referer 抓取更稳
+function coverHeaders() {
+  var h = {}
+  h['User-Agent'] = WEB_UA
+  h['Referer'] = 'https://fanqienovel.com/'
+  h['Accept'] = 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'
+  return h
+}
+
+// 封面 URL 规范化：搜索接口的 thumb_url 落在 p<N>-tt.bytecdn.cn，该 CDN 按域名
+// 直接返回 403 {"code":1004,"error":"domain forbidden"}（换 UA/Referer 无用）。
+// 实测**保留路径与 ~tplv-shrink:640:0.image 模板、只把 host 换成 p3-novel.byteimg.com**
+// 后同一张图返回 200 / image/png / magic 89504e470d0a1a0a（去掉 ~tplv 模板会 400）。
+// 其它 host（*-novel.byteimg.com、*-novel-sign.byteimg.com）本来就 200，保持原样；
+// 空串/非 http/相对路径同样原样返回。
+function fixCoverUrl(url) {
+  return cleanText("${url}", [['^https?://p[0-9]+-tt\\.bytecdn\\.cn/', 'https://p3-novel.byteimg.com/']])
+}
+
+// bytes 是否为可内联的图片字节：非空、非超大（仅看长度，不解析格式）
+function coverBytesOk(bytes) {
+  if (bytes == null) { return false }
+  var n = bytes.length
+  return n > 0 && n <= COVER_MAX_BYTES
+}
+
+function fqHeaders() {
+  var h = {}
+  h['User-Agent'] = FQ_UA
+  h['Cookie'] = "store-region=cn-zj; store-region-src=did; install_id=${installId}"
+  h['Accept'] = 'application/json; charset=utf-8'
+  h['Accept-Encoding'] = 'gzip'
+  h['x-xs-from-web'] = '0'
+  h['x-ss-req-ticket'] = rticket
+  h['x-reading-request'] = "${rticket}-0"
+  h['x-vc-bdturing-sdk-version'] = '3.7.2.cn'
+  h['lc'] = '101'
+  h['sdk-version'] = '2'
+  h['passport-sdk-version'] = '50564'
+  h['x-tt-store-region'] = 'cn-zj'
+  h['x-tt-store-region-src'] = 'did'
+  return h
+}
+
+function applySig(headers, sig) {
+  for (var i = 0; i < SIG_KEYS.length; i = i + 1) {
+    var v = sig[SIG_KEYS[i]]
+    if (v != null) { headers[SIG_KEYS[i]] = "${v}" }
+  }
+}
+
+// 新契约：签名响应还带 cookie / ua，必须一并用于真实请求（否则与设备/签名不符）
+function applyEnvHeaders(headers, env) {
+  applySig(headers, env['headers'])
+  if (env['cookie'] != null) { headers['Cookie'] = "${env['cookie']}" }
+  if (env['ua'] != null) { headers['User-Agent'] = "${env['ua']}" }
+}
+
+// 固化池设备：/sign 首次返回 device/device_info 后，后续 /sign 都带 device 固定它，
+// 保证「设备 ↔ 密钥 ↔ 签名」一致；device_info.device_id 用于构造 registerkey 请求体。
+function captureSignEnv(env) {
+  if (env == null) { return }
+  if (env['device'] != null) { poolDevice = "${env['device']}" }
+  if (env['device_info'] != null && env['device_info']['device_id'] != null) {
+    poolDeviceId = "${env['device_info']['device_id']}"
+  }
+}
+
+// 构造 /sign 请求参数：已固化设备时用 JSON body {"url":...,"device":"..."} 固定该设备，
+// 否则用纯 URL 让服务端选设备（老服务端兼容 text/plain）。
+function signOptionsFor(targetUrl) {
+  if (poolDevice != '') {
+    return {
+      'url': signUrl, 'method': 'POST',
+      'body': '{"url":"' + targetUrl + '","device":"' + poolDevice + '"}',
+      'contentType': 'application/json'
+    }
+  }
+  return {'url': signUrl, 'method': 'POST', 'body': targetUrl, 'contentType': 'text/plain; charset=utf-8'}
+}
+
+// 公共查询串（顺序与 Main.java buildFqParams 一致）
+function fqQuery(extra) {
+  var pairs = [
+    ['iid', installId], ['device_id', deviceId], ['ac', 'wifi'], ['channel', 'googleplay'],
+    ['aid', '1967'], ['app_name', 'novelapp'], ['version_code', '68132'], ['version_name', '6.8.1.32'],
+    ['device_platform', 'android'], ['os', 'android'], ['ssmix', 'a'], ['device_type', 'OnePlus11'],
+    ['device_brand', 'OnePlus'], ['language', 'zh'], ['os_api', '32'], ['os_version', '12'],
+    ['manifest_version_code', '68132'], ['resolution', '3200*1440'], ['dpi', '640'],
+    ['update_version_code', '68132'], ['_rticket', rticket], ['host_abi', 'arm64-v8a'],
+    ['dragon_device_type', 'phone'], ['pv_player', '68132'], ['compliance_status', '0'],
+    ['need_personal_recommend', '1'], ['player_so_load', '1'], ['is_android_pad_screen', '0'],
+    ['rom_version', 'V291IR+release-keys'], ['cdid', cdid]
+  ]
+  var qs = '?'
+  for (var i = 0; i < pairs.length; i = i + 1) {
+    if (i > 0) { qs = qs + '&' }
+    qs = qs + pairs[i][0] + '=' + pairs[i][1]
+  }
+  for (var j = 0; j < extra.length; j = j + 1) {
+    qs = qs + '&' + extra[j][0] + '=' + extra[j][1]
+  }
+  return qs
+}
+
+function sliceBytes(src, from, to) {
+  var out = []
+  for (var i = from; i < to; i = i + 1) { out.add(src[i]) }
+  return out
+}
+
+function joinBytes(a, b) {
+  var out = []
+  for (var i = 0; i < a.length; i = i + 1) { out.add(a[i]) }
+  for (var j = 0; j < b.length; j = j + 1) { out.add(b[j]) }
+  return out
+}
+
+function parseInt10(s, fallback) {
+  if (s == null || s == '') { return fallback }
+  var n = parseInt(s)
+  if (n == null) { return fallback }
+  return n
+}
+
+// 取文本前 n 个字符（[\s\S] 匹配含换行在内的任意字符），失败日志里贴原始响应片段用
+function previewText(text, n) {
+  var t = "${text}"
+  if (t == '') { return '' }
+  return regexp("^[\\s\\S]{0,${n}}", t)
+}
+
+// ---- 详细日志：每个网络步骤都成对留一行，用于定位「卡在哪一步」 ----
+// 注：Hetu 无时钟，故不打印耗时；改用「请求 → 响应」配对 + 状态码 + 字符数 + 网络错误。
+function logReq(where, method, url) {
+  log('[请求] ${where} · ${method} ${url}')
+}
+
+function logResp(where, r) {
+  var text = "${r['text']}"
+  var line = '[响应] ${where} · HTTP ${r['status']} · ${text.length} 字符'
+  if (r['error'] != null) {
+    line = line + ' · 网络错误：${r['error']}'
+  }
+  log(line)
+}
+
+// 响应是否看起来像 JSON：避免把 HTML/空串喂给 JSON.parse 抛异常，导致回调静默中断
+function looksJson(text) {
+  var t = cleanText("${text}", [['^\\s+', ''], ['\\s+$', '']])
+  if (t == '') { return false }
+  if (regexp('^\\{', t) != '') { return true }
+  if (regexp('^\\[', t) != '') { return true }
+  return false
+}
+
+// /device/report 地址：由 sign_url 去掉末尾 /sign 再拼 /device/report
+// （默认 https://fq.gzxz.us.ci/sign ⇒ https://fq.gzxz.us.ci/device/report）
+function deviceReportUrl() {
+  var base = cleanText("${signUrl}", [['/sign$', '']])
+  if (base == '') { return signUrl }
+  return base + '/device/report'
+}
+
+// registerkey 请求体：AES(REG_KEY, LE64(devId) || LE64(0))，IV 置于密文前，整体 base64
+// devId 必须是 /sign 返回的 device_info.device_id（硬编码设备会 verify fail）
+function newRegisterKeyContent(devId) {
+  var n = parseInt(devId)
+  var le = []
+  for (var i = 0; i < 8; i = i + 1) {
+    var b = n % 256
+    le.add(b)
+    n = ((n - b) / 256).toInt()
+  }
+  var combined = le
+  for (var z = 0; z < 8; z = z + 1) { combined.add(0) }
+  // 固定 IV：registerkey 是一次性密钥封装，服务端只按前 16 字节当 IV 解密
+  var iv = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  var ct = aesEncrypt({
+    'data': combined, 'key': REG_KEY, 'keyEncoding': 'hex',
+    'iv': iv, 'mode': 'cbc', 'padding': 'pkcs7'
+  })
+  return base64Encode(joinBytes(iv, ct))
+}
+
+// 用 REG_KEY 解出响应里的 key，并取前 32 个 hex 字符
+function getRealKey(keyB64) {
+  if (keyB64 == null) { return '' }
+  var raw = base64Decode("${keyB64}")
+  if (raw.length < 32 || (raw.length - 16) % 16 != 0) { return '' }
+  var iv = sliceBytes(raw, 0, 16)
+  var ct = sliceBytes(raw, 16, raw.length)
+  var dec = aesDecrypt({
+    'data': ct, 'key': REG_KEY, 'keyEncoding': 'hex',
+    'iv': iv, 'mode': 'cbc', 'padding': 'pkcs7'
+  })
+  return regexp('^([0-9a-fA-F]{32})', hexEncode(dec), '1')
+}
+
+// 正文：base64 -> AES-128-CBC(PKCS7, IV = 前 16 字节) -> 可能再套 gzip -> utf8
+function decryptContent(contentB64, keyHex) {
+  if (contentB64 == null || contentB64 == '' || keyHex == '') { return '' }
+  var raw = base64Decode("${contentB64}")
+  if (raw.length < 32 || (raw.length - 16) % 16 != 0) { return '' }
+  var iv = sliceBytes(raw, 0, 16)
+  var ct = sliceBytes(raw, 16, raw.length)
+  var dec = aesDecrypt({
+    'data': ct, 'key': keyHex, 'keyEncoding': 'hex',
+    'iv': iv, 'mode': 'cbc', 'padding': 'pkcs7'
+  })
+  if (dec.length >= 2 && dec[0] == 31 && dec[1] == 139) {
+    return decode(gunzip(dec), 'utf8')
+  }
+  return decode(dec, 'utf8')
+}
+
+// 正文清洗：去掉首个 <blk>（章节标题）、去标签、还原实体、收敛空行
+function cleanBody(raw) {
+  if (raw == null || raw == '') { return '' }
+  var body = "${raw}"
+  if (regexp('<blk', body) != '') {
+    var blocks = regexpAll('<blk[^>]*>([\\s\\S]*?)</blk>', body, '1')
+    if (blocks.length > 1) {
+      body = ''
+      for (var i = 1; i < blocks.length; i = i + 1) {
+        if (i > 1) { body = body + '\n' }
+        body = body + blocks[i]
+      }
+    } else if (blocks.length == 1) {
+      body = blocks[0]
+    }
+  }
+  body = cleanText(body, [
+    ['(?i)<br\\s*/?>', '\n'],
+    ['(?is)<[^>]+>', ''],
+    ['&nbsp;', ' '],
+    ['&amp;', '&'],
+    ['&lt;', '<'],
+    ['&gt;', '>'],
+    ['&quot;', '"'],
+    ['&apos;', "'"],
+    ['(?m)^[ \\t]+', ''],
+    ['(?m)[ \\t]+$', ''],
+    ['^\\s+', ''],
+    ['\\s+$', ''],
+    ['\\n{3,}', '\n\n']
+  ])
+  return body
+}
+
+function readerErr(where, code, msg) {
+  if (code == 110) {
+    return "${where}失败：ILLEGAL_ACCESS（code=110，设备被番茄风控/封禁）。请更换 device_id/install_id/cdid 后重启签名服务，或稍后再试。"
+  }
+  if (code == 100) {
+    return "${where}失败：FAST_REJECT（code=100，请求过快），请降低频率后重试。"
+  }
+  if (code == 101014) {
+    return "${where}失败：章节内容不可用（code=101014，服务端未返回 content，可能为受限/下架章节）"
+  }
+  var names = {}
+  names[1] = 'SYSTEM'
+  names[2] = 'INVALID_REQ'
+  names[111] = 'HIT_VERIFY_CODE'
+  names[500000] = 'KEY_TOO_OLD'
+  names[500001] = 'ESCAPE_KEY'
+  names[500002] = 'VERIFY_FAIL'
+  names[101004] = 'BOOK_NOT_EXIST'
+  names[101005] = 'CHAPTER_DATA_GET_ERROR'
+  names[101009] = 'USER_NO_PERMISSION'
+  names[101017] = 'CONTENT_VERIFYING'
+  names[101021] = 'BOOK_FULLLY_REMOVE'
+  var name = names[code] == null ? 'UNKNOWN' : names[code]
+  return "${where}失败：${name} (code=${code}) ${msg}"
+}
+
+// ------------------------- search -------------------------
+
+// search 封面内联：并发抓每条 cover 的字节，写入 item['coverData']。
+// 失败/超大只 log 并降级（绝不中断搜索）。每条有多个候选 URL（规范化 thumb_url →
+// 规范化 audio_thumb_uri → 原 thumb_url），第一个抓成的写 coverData 并把 item['cover']
+// 换成该可用 URL。用全局计数，全部落定后 result 一次。
+var SEARCH_ITEMS = []
+var SEARCH_CANDIDATES = []
+var SEARCH_PENDING = 0
+
+function searchCoverDone() {
+  SEARCH_PENDING = SEARCH_PENDING - 1
+  if (SEARCH_PENDING <= 0) {
+    result({'items': SEARCH_ITEMS})
+  }
+}
+
+// 依次尝试 index 条目的候选封面；某个候选成功即落定，全部失败则保留规范化后的 cover URL
+function trySearchCover(index, cand) {
+  var list = SEARCH_CANDIDATES[index]
+  if (cand >= list.length) {
+    log("封面内联失败（忽略，保留 URL）：${list.length} 个候选均不可用")
+    searchCoverDone()
+  } else {
+    var url = "${list[cand]}"
+    httpRequest({
+      'url': url, 'method': 'GET', 'headers': coverHeaders(), 'wantBytes': true,
+      'connectTimeoutMs': 8000, 'idleTimeoutMs': 12000
+    }).then((r) {
+      if (r['status'] == 200 && coverBytesOk(r['bytes'])) {
+        SEARCH_ITEMS[index]['coverData'] = base64Encode(r['bytes'])
+        SEARCH_ITEMS[index]['cover'] = url
+        log("封面内联 ${index + 1}/${SEARCH_ITEMS.length}：${r['bytes'].length} 字节（候选 ${cand + 1}）")
+        searchCoverDone()
+      } else {
+        log("封面候选 ${cand + 1} 不可用（HTTP ${r['status']}），尝试下一个")
+        trySearchCover(index, cand + 1)
+      }
+    })
+  }
+}
+
+function inlineSearchCovers(items, candidates) {
+  SEARCH_ITEMS = items
+  SEARCH_CANDIDATES = candidates
+  SEARCH_PENDING = 0
+  for (var i = 0; i < items.length; i = i + 1) {
+    if (candidates[i].length > 0) {
+      SEARCH_PENDING = SEARCH_PENDING + 1
+      trySearchCover(i, 0)
+    }
+  }
+  if (SEARCH_PENDING == 0) {
+    result({'items': items})
+  }
+}
+
+function runSearch() {
+  var q = param('query', '')
+  if (q == '') {
+    log('搜索关键词为空')
+    result({'items': []})
+  } else {
+    var ci = param('cover_inline', '1')
+    var coverInline = true
+    if (ci == '0' || ci == 'false' || ci == 'no' || ci == 'False') { coverInline = false }
+    var url = SEARCH_URL + '?q=' + urlEncode(q) + '&aid=1967'
+    log('搜索：' + q)
+    var headers = {}
+    headers['User-Agent'] = WEB_UA
+    headers['Accept'] = 'application/json, text/plain, */*'
+    httpRequest({'url': url, 'method': 'GET', 'headers': headers}).then((r) {
+      if (r['status'] != 200) {
+        log("搜索失败：HTTP ${r['status']}，响应前 200 字符：${previewText(r['text'], 200)}")
+        result({'items': []})
+      } else if (!looksJson(r['text'])) {
+        log("搜索响应非 JSON（HTTP ${r['status']}），响应前 200 字符：${previewText(r['text'], 200)}")
+        result({'items': []})
+      } else {
+        var root = JSON.parse(r['text'])
+        var data = root == null ? null : root['data']
+        var items = []
+        var candidates = []
+        if (data != null) {
+          var ret = data['ret_data']
+          if (ret != null) {
+            for (var i = 0; i < ret.length; i = i + 1) {
+              var v = ret[i]
+              var item = {}
+              item['id'] = v['book_id'] == null ? '' : "${v['book_id']}"
+              item['title'] = v['title'] == null ? '' : "${v['title']}"
+              item['author'] = v['author'] == null ? '' : "${v['author']}"
+              // 番茄搜索接口的封面字段是 thumb_url（旧脚本误写成 thumb，永远取不到）。
+              // 规范化后作为 cover；原 audio_thumb_uri / 原 thumb_url 只作抓取兜底候选。
+              var thumb = v['thumb_url'] == null ? '' : "${v['thumb_url']}"
+              var audio = v['audio_thumb_uri'] == null ? '' : "${v['audio_thumb_uri']}"
+              var cover = fixCoverUrl(thumb)
+              item['cover'] = cover
+              var abstract = v['abstract'] == null ? '' : "${v['abstract']}"
+              item['intro'] = abstract
+              item['description'] = abstract
+              // coverData 默认空；开启 cover_inline 时由内联抓取填充
+              item['coverData'] = ''
+              items.add(item)
+              var list = []
+              if (cover != '') { list.add(cover) }
+              var af = fixCoverUrl(audio)
+              if (af != '' && af != cover) { list.add(af) }
+              if (thumb != '' && thumb != cover && thumb != af) { list.add(thumb) }
+              candidates.add(list)
+            }
+          }
+        }
+        log("命中 ${items.length} 条（cover_inline=${coverInline}）")
+        if (coverInline) {
+          inlineSearchCovers(items, candidates)
+        } else {
+          result({'items': items})
+        }
+      }
+    })
+  }
+}
+
+// ------------------------- 书籍元数据（author/cover） -------------------------
+
+// 从签名详情接口 /reading/bookapi/detail/v1 的 data 解析元数据
+function bookMetaFromData(d) {
+  var meta = {'title': '', 'author': '', 'cover': '', 'description': ''}
+  if (d == null) { return meta }
+  meta['title'] = d['book_name'] == null ? '' : "${d['book_name']}"
+  meta['author'] = d['author'] == null ? '' : "${d['author']}"
+  if (meta['author'] == '' && d['original_author'] != null) {
+    meta['author'] = "${d['original_author']}"
+  }
+  var cover = d['thumb_url']
+  if (cover == null) { cover = d['expand_thumb_url'] }
+  if (cover == null) { cover = d['detail_page_thumb_url'] }
+  meta['cover'] = cover == null ? '' : fixCoverUrl("${cover}")
+  var abs = d['book_abstract_v2']
+  if (abs == null) { abs = d['abstract'] }
+  meta['description'] = abs == null ? '' : "${abs}"
+  return meta
+}
+
+// 从无签名网页 https://fanqienovel.com/page/<id> 解析元数据（download 阶段用，
+// 不额外消耗签名服务配额）。网页里的封面 URL 用 \u002F 转义斜杠，需还原。
+function bookMetaFromPage(html) {
+  var meta = {'title': '', 'author': '', 'cover': ''}
+  if (html == null) { return meta }
+  var h = "${html}"
+  if (h == '') { return meta }
+  meta['title'] = regexp('"bookName"\\s*:\\s*"([^"]*)"', h, '1')
+  meta['author'] = regexp('"authorName"\\s*:\\s*"([^"]*)"', h, '1')
+  if (meta['author'] == '') {
+    meta['author'] = regexp('"author"\\s*:\\s*"([^"]*)"', h, '1')
+  }
+  var cover = regexp('"thumbUrl"\\s*:\\s*"([^"]*)"', h, '1')
+  if (cover == '') { cover = regexp('"thumbUri"\\s*:\\s*"([^"]*)"', h, '1') }
+  meta['cover'] = fixCoverUrl(cleanText(cover, [['\\\\u002F', '/']]))
+  return meta
+}
+
+// ------------------------- detail（向后兼容，应用已不再调用） -------------------------
+
+function runDetail() {
+  var id = param('id', '')
+  if (id == '') {
+    log('详情缺少 id')
+    result({'id': '', 'title': '', 'author': '', 'description': '', 'cover': ''})
+  } else {
+    var url = apiBase + '/reading/bookapi/detail/v1' + fqQuery([['book_id', id]])
+    httpRequest(signOptionsFor(url)).then((sr) {
+      if (sr['status'] != 200) {
+        log("签名服务失败：HTTP ${sr['status']}，响应前 200 字符：${previewText(sr['text'], 200)}")
+        result({'id': id, 'title': '', 'author': '', 'description': '', 'cover': ''})
+      } else if (!looksJson(sr['text'])) {
+        log("签名服务返回非 JSON（HTTP ${sr['status']}）：${previewText(sr['text'], 200)}")
+        result({'id': id, 'title': '', 'author': '', 'description': '', 'cover': ''})
+      } else {
+        var env = JSON.parse(sr['text'])
+        if (env == null || env['ok'] != true) {
+          log("签名服务返回异常：${previewText(sr['text'], 200)}")
+          result({'id': id, 'title': '', 'author': '', 'description': '', 'cover': ''})
+        } else {
+          captureSignEnv(env)
+          var headers = fqHeaders()
+          applyEnvHeaders(headers, env)
+          httpRequest({'url': url, 'method': 'GET', 'headers': headers}).then((r) {
+            if (r['status'] != 200) {
+              log("详情失败：HTTP ${r['status']}，响应前 200 字符：${previewText(r['text'], 200)}")
+              result({'id': id, 'title': '', 'author': '', 'description': '', 'cover': ''})
+            } else if (!looksJson(r['text'])) {
+              log("详情响应非 JSON（HTTP ${r['status']}）：${previewText(r['text'], 200)}")
+              result({'id': id, 'title': '', 'author': '', 'description': '', 'cover': ''})
+            } else {
+              var root = JSON.parse(r['text'])
+              var code = (root == null || root['code'] == null) ? -1 : parseInt("${root['code']}")
+              if (code != 0) {
+                log(readerErr('详情', code, "${root == null ? '' : root['message']}"))
+                result({'id': id, 'title': '', 'author': '', 'description': '', 'cover': ''})
+              } else {
+                var payload = bookMetaFromData(root['data'])
+                payload['id'] = id
+                log("详情：${payload['title']} / ${payload['author']}")
+                result(payload)
+              }
+            }
+          })
+        }
+      }
+    })
+  }
+}
+
+// ------------------------- download -------------------------
+
+// download 阶段自身的元数据（应用不会把 author 传进来，脚本自己取网页详情）
+var DL_BOOK_ID = ''
+var DL_SELECTED = []
+var DL_USE_BATCH = true
+var DL_AUTHOR = ''
+var DL_COVER = ''
+var DL_COVER_DATA = ''
+var DL_TITLE = ''
+// 失败批次记录（交回部分结果时用）：缺失范围字符串列表
+var DL_MISSING = []
+// 是否已交回结果：失败路径显式守卫，避免重复组装
+var DL_FINISHED = false
+
+function assemble(selected, contents) {
+  var chapters = []
+  var totalChars = 0
+  var emptyCount = 0
+  for (var i = 0; i < selected.length; i = i + 1) {
+    var e = {}
+    e['title'] = selected[i]['title']
+    var body = contents[selected[i]['id']]
+    if (body == null || body == '') { emptyCount = emptyCount + 1 }
+    e['body'] = body == null ? '' : body
+    totalChars = totalChars + e['body'].length
+    chapters.add(e)
+  }
+  log("正文组装完成，共 ${chapters.length} 章、${totalChars} 字符（作者=${DL_AUTHOR == '' ? '（空，应用将回退）' : DL_AUTHOR}，封面内联=${DL_COVER_DATA == '' ? '否（用 URL）' : '是'}）")
+  if (emptyCount > 0) {
+    log("注意：${emptyCount} 章正文为空（服务端未返回 content，或该批失败），已按空正文占位、保留章节目录")
+  }
+  // 一章都没取到时按「整体失败」交回空章节，避免应用拿全空正文章节去生成空 EPUB
+  if (selected.length > 0 && emptyCount == selected.length) {
+    log("全部 ${selected.length} 章均未取到正文，按整体失败交回空章节")
+    DL_FINISHED = true
+    result({'id': DL_BOOK_ID, 'chapters': [], 'author': DL_AUTHOR, 'cover': DL_COVER, 'coverData': DL_COVER_DATA})
+    return
+  }
+  var payload = {}
+  payload['id'] = DL_BOOK_ID
+  payload['chapters'] = chapters
+  // 新契约：download 可补充 author（优先于搜索结果）与封面：
+  //   coverData(裸 base64，优先) > cover(URL 兜底)
+  payload['author'] = DL_AUTHOR
+  payload['cover'] = DL_COVER
+  payload['coverData'] = DL_COVER_DATA
+  // 部分成功时附带缺失范围（应用会忽略未知字段，仅供排查/上层使用）
+  if (DL_MISSING.length > 0) { payload['missing'] = DL_MISSING }
+  DL_FINISHED = true
+  result(payload)
+}
+
+// 某批失败/异常：记录缺失范围，照常交回已取到的章节（绝不因一批失败丢弃全部进度）
+function finishPartial(selected, contents, reason, rangeLabel) {
+  if (DL_FINISHED) { return }
+  log("【下载中断】${reason}")
+  if (rangeLabel != '') {
+    DL_MISSING.add(rangeLabel)
+    log("缺失范围：${rangeLabel}；已取到的章节照常交回，不丢弃进度")
+  }
+  assemble(selected, contents)
+}
+
+// 批量接口：递归取每批（≤group_size 章），成功后组装
+// - 任一失败都有可读日志（HTTP 状态 / root.code / message / 原始响应前 200 字符）
+// - 某批失败只标记缺失范围并交回已取到的章节，绝不丢弃进度
+// - 解码后文本超过 BATCH_TEXT_LIMIT 时把该批折半重试，降低内存峰值
+function fetchBatches(bookId, selected, keyHex, from, size, contents) {
+  if (from >= selected.length) {
+    assemble(selected, contents)
+  } else {
+    var to = from + size
+    if (to > selected.length) { to = selected.length }
+    var batchRange = "第 ${from + 1}~${to} 章"
+    log("→ ${batchRange}（共 ${selected.length} 章，已完成 ${from}，本批 ${to - from} 章）")
+    var ids = ''
+    for (var i = from; i < to; i = i + 1) {
+      if (i > from) { ids = ids + ',' }
+      ids = ids + selected[i]['id']
+    }
+    var url = apiBase + '/reading/reader/batch_full/v1' + fqQuery([
+      ['item_ids', ids], ['key_register_ts', '0'], ['book_id', bookId], ['req_type', '1']
+    ])
+    var op = {'kind': 'batch', 'bookId': bookId, 'selected': selected, 'keyHex': keyHex, 'from': from, 'size': size, 'contents': contents}
+    logReq('签名', 'POST', signUrl)
+    httpRequest(signOptionsFor(url)).then((sr) {
+      logResp('签名', sr)
+      if (sr['status'] != 200) {
+        handleDownloadFailure(op, "签名服务失败：HTTP ${sr['status']}，响应前 200 字符：${previewText(sr['text'], 200)}", '')
+      } else if (!looksJson(sr['text'])) {
+        handleDownloadFailure(op, "签名服务返回非 JSON（HTTP ${sr['status']}），响应前 200 字符：${previewText(sr['text'], 200)}", '')
+      } else {
+        var env = JSON.parse(sr['text'])
+        if (env == null || env['ok'] != true) {
+          handleDownloadFailure(op, "签名服务返回异常，响应前 200 字符：${previewText(sr['text'], 200)}", '')
+        } else {
+          captureSignEnv(env)
+          var headers = fqHeaders()
+          applyEnvHeaders(headers, env)
+          // 新契约：真实请求必须用服务端返回的 url（按设备改写）；解密优先用现取的 registerkey key
+          var envUrl = env['url'] == null ? url : "${env['url']}"
+          var envKey = keyHex
+          if (envKey == '' && env['key'] != null) { envKey = "${env['key']}" }
+          var envDevice = env['device'] == null ? '' : "${env['device']}"
+          log('[正文] 签名完成：device=${envDevice}，解密 key=${envKey.length} 字符（${keyHex == '' ? '回退 /sign 的 key' : '现取 registerkey'}）')
+          logReq('正文(批量)', 'GET', envUrl)
+          httpRequest({'url': envUrl, 'method': 'GET', 'headers': headers}).then((r) {
+            logResp('正文(批量)', r)
+            if (r['status'] != 200) {
+              finishPartial(selected, contents, "正文失败：HTTP ${r['status']}（${batchRange}），响应前 200 字符：${previewText(r['text'], 200)}", batchRange)
+            } else if (!looksJson(r['text'])) {
+              var emptyBody = "${r['text']}".length == 0
+              var why = emptyBody ? "正文响应为空（HTTP 200 且 0 字节）" : "正文响应非 JSON（HTTP ${r['status']}）"
+              handleDownloadFailure(op, why + "（${batchRange}），响应前 200 字符：${previewText(r['text'], 200)}", envDevice)
+            } else {
+              // 峰值保护（仅 auto_halve 打开时）：解码后文本过大时折半重试；此时尚未 JSON.parse
+              var textLen = "${r['text']}".length
+              var halved = false
+              if (textLen > BATCH_TEXT_LIMIT) {
+                if (AUTO_HALVE) {
+                  if ((to - from) > 1) {
+                    var half = ((to - from) / 2).toInt()
+                    if (half < 1) { half = 1 }
+                    log("本批解码文本 ${textLen} 字符 > 上限 ${BATCH_TEXT_LIMIT}（${batchRange}），auto_halve=1 ⇒ 折半为每批 ≤${half} 章重试")
+                    halved = true
+                    fetchBatches(bookId, selected, keyHex, from, half, contents)
+                  } else {
+                    log("本批解码文本 ${textLen} 字符 > 上限 ${BATCH_TEXT_LIMIT}（${batchRange}），但本批仅 1 章无法再折半，按原批解析")
+                  }
+                } else {
+                  log("本批解码文本 ${textLen} 字符 > 上限 ${BATCH_TEXT_LIMIT}（${batchRange}），auto_halve=0（默认）⇒ 不折半，按原批解析")
+                }
+              }
+              if (!halved) {
+                var root = JSON.parse(r['text'])
+                var code = (root == null || root['code'] == null) ? -1 : parseInt("${root['code']}")
+                log('[正文] code=${code} message=${root == null ? '' : root['message']}')
+                if (code != 0) {
+                  var berr = readerErr('正文', code, "${root == null ? '' : root['message']}") + "；响应前 200 字符：" + previewText(r['text'], 200)
+                  if (code == 110 || code == 100) {
+                    handleDownloadFailure(op, berr, envDevice)
+                  } else {
+                    finishPartial(selected, contents, berr, batchRange)
+                  }
+                } else {
+                  var data = root['data']
+                  var noContent = 0
+                  var sample = ''
+                  for (var k = from; k < to; k = k + 1) {
+                    var itemId = selected[k]['id']
+                    var text = ''
+                    if (data != null) {
+                      var item = data[itemId]
+                      if (item != null && item['content'] != null) {
+                        var crypt = item['crypt_status'] == null ? 0 : parseInt("${item['crypt_status']}")
+                        if (crypt == 1 || crypt == 2) {
+                          text = cleanBody("${item['content']}")
+                        } else {
+                          text = cleanBody(decryptContent("${item['content']}", envKey))
+                        }
+                      } else {
+                        noContent = noContent + 1
+                        if (sample == '' && item != null) {
+                          sample = "itemId=${itemId} code=${item['code']} code_i32=${item['code_i32']}"
+                        }
+                      }
+                    } else {
+                      noContent = noContent + 1
+                    }
+                    contents[itemId] = text
+                  }
+                  if (noContent > 0) {
+                    log("本批 ${noContent} 章无正文（服务端未返回 content；示例：${sample}），已按空正文占位后继续")
+                  }
+                  log("✓ ${batchRange} 完成：取到正文 ${to - from - noContent}/${to - from} 章，累计 ${to}/${selected.length}")
+                  fetchBatches(bookId, selected, keyHex, to, size, contents)
+                }
+              }
+            }
+          })
+        }
+      }
+    })
+  }
+}
+
+// 单章接口：递归逐章取（同样用 /sign 返回的 url+key，失败上报换设备一次、只标缺失不丢进度）
+function fetchSingles(bookId, selected, keyHex, index, contents) {
+  if (index >= selected.length) {
+    assemble(selected, contents)
+  } else {
+    var itemId = selected[index]['id']
+    var chRange = "第 ${index + 1} 章"
+    var url = apiBase + '/reading/reader/full/v1' + fqQuery([
+      ['item_id', itemId], ['key_register_ts', '0'], ['req_type', '1'], ['book_id', bookId]
+    ])
+    var op = {'kind': 'single', 'bookId': bookId, 'selected': selected, 'keyHex': keyHex, 'index': index, 'contents': contents}
+    logReq('签名', 'POST', signUrl)
+    httpRequest(signOptionsFor(url)).then((sr) {
+      logResp('签名', sr)
+      if (sr['status'] != 200) {
+        handleDownloadFailure(op, "签名服务失败：HTTP ${sr['status']}，响应前 200 字符：${previewText(sr['text'], 200)}", '')
+      } else if (!looksJson(sr['text'])) {
+        handleDownloadFailure(op, "签名服务返回非 JSON（HTTP ${sr['status']}），响应前 200 字符：${previewText(sr['text'], 200)}", '')
+      } else {
+        var env = JSON.parse(sr['text'])
+        if (env == null || env['ok'] != true) {
+          handleDownloadFailure(op, "签名服务返回异常，响应前 200 字符：${previewText(sr['text'], 200)}", '')
+        } else {
+          captureSignEnv(env)
+          var headers = fqHeaders()
+          applyEnvHeaders(headers, env)
+          var envUrl = env['url'] == null ? url : "${env['url']}"
+          var envKey = keyHex
+          if (envKey == '' && env['key'] != null) { envKey = "${env['key']}" }
+          var envDevice = env['device'] == null ? '' : "${env['device']}"
+          log('[正文] 签名完成：device=${envDevice}，解密 key=${envKey.length} 字符（${keyHex == '' ? '回退 /sign 的 key' : '现取 registerkey'}）')
+          logReq('正文(单章)', 'GET', envUrl)
+          httpRequest({'url': envUrl, 'method': 'GET', 'headers': headers}).then((r) {
+            logResp('正文(单章)', r)
+            if (r['status'] != 200) {
+              finishPartial(selected, contents, "正文失败：HTTP ${r['status']}（${chRange}），响应前 200 字符：${previewText(r['text'], 200)}", chRange)
+            } else if (!looksJson(r['text'])) {
+              var emptyBody = "${r['text']}".length == 0
+              var why = emptyBody ? "正文响应为空（HTTP 200 且 0 字节）" : "正文响应非 JSON（HTTP ${r['status']}）"
+              handleDownloadFailure(op, why + "（${chRange}），响应前 200 字符：${previewText(r['text'], 200)}", envDevice)
+            } else {
+              var root = JSON.parse(r['text'])
+              var code = (root == null || root['code'] == null) ? -1 : parseInt("${root['code']}")
+              if (code != 0) {
+                var serr = readerErr('正文', code, "${root == null ? '' : root['message']}") + "；响应前 200 字符：" + previewText(r['text'], 200)
+                if (code == 110 || code == 100) {
+                  handleDownloadFailure(op, serr, envDevice)
+                } else {
+                  finishPartial(selected, contents, serr, chRange)
+                }
+              } else {
+                var data = root['data']
+                var text = ''
+                if (data != null) {
+                  var item = data['content'] == null ? data[itemId] : data
+                  if (item != null && item['content'] != null) {
+                    var crypt = item['crypt_status'] == null ? 0 : parseInt("${item['crypt_status']}")
+                    if (crypt == 1 || crypt == 2) {
+                      text = cleanBody("${item['content']}")
+                    } else {
+                      text = cleanBody(decryptContent("${item['content']}", envKey))
+                    }
+                  } else {
+                    log("本章无正文（服务端未返回 content），已按空正文占位：itemId=${itemId}")
+                  }
+                } else {
+                  log("本章响应 data 为空，已按空正文占位：itemId=${itemId}")
+                }
+                contents[itemId] = text
+                log("第 ${index + 1}/${selected.length} 章完成（正文 ${text.length} 字符）")
+                fetchSingles(bookId, selected, keyHex, index + 1, contents)
+              }
+            }
+          })
+        }
+      }
+    })
+  }
+}
+
+// 进入正文下载（keyHex 为现取现用的 registerkey 真实密钥；为空时每批回退 /sign 的 key）
+function startContentDownload(bookId, selected, keyHex, useBatch) {
+  log('解密密钥已就绪')
+  var contents = {}
+  if (useBatch) {
+    fetchBatches(bookId, selected, keyHex, 0, parseInt10(param('group_size', '50'), 50), contents)
+  } else {
+    fetchSingles(bookId, selected, keyHex, 0, contents)
+  }
+}
+
+// 取解密密钥后进入正文下载
+// 解密密钥「现取现用」：用 /sign 返回的 device_info.device_id 调 registerkey 拿真实 key；
+// /sign 的 key 是启动时注册所得、可能已过期，仅在 registerkey 失败时兜底（实测常解不开）。
+function fetchKeyThenContent(bookId, selected, useBatch) {
+  var rkUrl = apiBase + '/reading/crypt/registerkey' + fqQuery([])
+  var op = {'kind': 'key', 'bookId': bookId, 'selected': selected, 'useBatch': useBatch}
+  log('[阶段] 取解密密钥：POST ${signUrl}')
+  logReq('签名', 'POST', signUrl)
+  httpRequest(signOptionsFor(rkUrl)).then((sr) {
+    logResp('签名', sr)
+    if (sr['status'] != 200) {
+      handleDownloadFailure(op, "签名服务失败：HTTP ${sr['status']}，响应前 200 字符：${previewText(sr['text'], 200)}", '')
+    } else if (!looksJson(sr['text'])) {
+      handleDownloadFailure(op, "签名服务返回非 JSON（HTTP ${sr['status']}），响应前 200 字符：${previewText(sr['text'], 200)}", '')
+    } else {
+      var env = JSON.parse(sr['text'])
+      if (env == null || env['ok'] != true) {
+        handleDownloadFailure(op, "签名服务返回异常，响应前 200 字符：${previewText(sr['text'], 200)}", '')
+      } else {
+        captureSignEnv(env)
+        var headers = fqHeaders()
+        applyEnvHeaders(headers, env)
+        // 新契约：registerkey 请求也要打到服务端改写后的 url
+        var envUrl = env['url'] == null ? rkUrl : "${env['url']}"
+        var signKey = env['key'] == null ? '' : "${env['key']}"
+        var envDevice = env['device'] == null ? '' : "${env['device']}"
+        // registerkey 请求体必须用该设备的 device_info.device_id（硬编码会 verify fail）
+        var regDev = poolDeviceId == '' ? deviceId : poolDeviceId
+        var ckFlag = env['cookie'] == null ? '无' : '有'
+        var uaFlag = env['ua'] == null ? '无' : '有'
+        log('[签名] device=${envDevice} primary=${env['primary']} key=${signKey.length} 字符 cookie=${ckFlag} ua=${uaFlag}')
+        log('[签名] 改写后 url=${envUrl}')
+        log("现取现用：device=${envDevice}，device_id=${regDev} 调 registerkey")
+        var enc = newRegisterKeyContent(regDev)
+        var body = '{"content":"' + enc + '","keyver":1}'
+        logReq('registerkey', 'POST', envUrl)
+        httpRequest({'url': envUrl, 'method': 'POST', 'body': body, 'contentType': 'application/json', 'headers': headers}).then((rr) {
+          logResp('registerkey', rr)
+          if (rr['status'] != 200) {
+            log("registerkey 失败：HTTP ${rr['status']}，响应前 200 字符：${previewText(rr['text'], 200)}")
+            if (signKey != '') { startContentDownload(bookId, selected, signKey, useBatch) } else { result({'chapters': []}) }
+          } else if (!looksJson(rr['text'])) {
+            log("registerkey 响应非 JSON（HTTP ${rr['status']}）：${previewText(rr['text'], 200)}")
+            if (signKey != '') { startContentDownload(bookId, selected, signKey, useBatch) } else { result({'chapters': []}) }
+          } else {
+            var root = JSON.parse(rr['text'])
+            var code = (root == null || root['code'] == null) ? -1 : parseInt("${root['code']}")
+            if (code != 0) {
+              var kerr = readerErr('registerkey', code, "${root == null ? '' : root['message']}") + "；响应前 200 字符：" + previewText(rr['text'], 200)
+              if (code == 110 || code == 100) {
+                handleDownloadFailure(op, kerr, envDevice)
+              } else {
+                log(kerr)
+                if (signKey != '') { startContentDownload(bookId, selected, signKey, useBatch) } else { result({'chapters': []}) }
+              }
+            } else {
+              var keyB64 = root['data'] == null ? null : root['data']['key']
+              var keyHex = getRealKey(keyB64)
+              log('[密钥] registerkey 现取成功：key=${keyHex.length} 字符')
+              // 解密优先用现调 registerkey 得到的 key；仅当它缺失时才回退 /sign 的 key
+              if (keyHex == '' && signKey != '') {
+                log("registerkey 未取到 key，回退用 /sign 的 key")
+                keyHex = signKey
+              }
+              if (keyHex == '') {
+                log('registerkey 未取到有效密钥')
+                result({'chapters': []})
+              } else {
+                startContentDownload(bookId, selected, keyHex, useBatch)
+              }
+            }
+          }
+        })
+      }
+    }
+  })
+}
+
+// 取书籍网页详情（无签名）拿作者/封面，然后进入正文下载。
+// 放在 fetchKeyThenContent 之后定义，保证引用顺序自上而下。
+function fetchBookMetaThenContent(bookId, selected, useBatch) {
+  DL_BOOK_ID = bookId
+  DL_SELECTED = selected
+  DL_USE_BATCH = useBatch
+  DL_AUTHOR = ''
+  DL_COVER = ''
+  DL_COVER_DATA = ''
+  DL_TITLE = ''
+  DL_MISSING = []
+  DL_FINISHED = false
+  // 每次下载重新选设备（首次 /sign 不带 device，服务端选一台后再固化）
+  poolDevice = ''
+  poolDeviceId = ''
+  var pageUrl = param('detail_url', 'https://fanqienovel.com/page/' + bookId)
+  log("获取书籍详情（作者/封面）：${pageUrl}")
+  var ph = {}
+  ph['User-Agent'] = WEB_UA
+  ph['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+  logReq('详情页', 'GET', pageUrl)
+  httpRequest({'url': pageUrl, 'method': 'GET', 'headers': ph}).then((pr) {
+    logResp('详情页', pr)
+    if (pr['status'] != 200) {
+      log("书籍详情页失败：HTTP ${pr['status']}（忽略，作者/封面留空）")
+      fetchKeyThenContent(DL_BOOK_ID, DL_SELECTED, DL_USE_BATCH)
+    } else {
+      var meta = bookMetaFromPage("${pr['text']}")
+      DL_TITLE = meta['title']
+      DL_AUTHOR = meta['author']
+      DL_COVER = meta['cover']
+      if (DL_AUTHOR == '') {
+        log('书籍详情页未解析到作者（忽略，留空）')
+      } else {
+        log("书籍详情：${DL_TITLE} / ${DL_AUTHOR}")
+      }
+      inlineDownloadCoverThenContent()
+    }
+  })
+}
+
+// 抓封面字节内联为 coverData（带 Referer 破 CDN 防盗链），成功后再进正文；
+// 任何失败/超大只 log 降级（留空 coverData，仍交 cover URL），绝不中断正文下载。
+function inlineDownloadCoverThenContent() {
+  if (DL_COVER == '') {
+    log('无封面 URL，跳过内联（应用将回退搜索结果封面）')
+    fetchKeyThenContent(DL_BOOK_ID, DL_SELECTED, DL_USE_BATCH)
+  } else {
+    log("抓取封面字节（内联 coverData）：${DL_COVER}")
+    httpRequest({
+      'url': DL_COVER, 'method': 'GET', 'headers': coverHeaders(), 'wantBytes': true,
+      'connectTimeoutMs': 8000, 'idleTimeoutMs': 12000
+    }).then((cr) {
+      logResp('封面', cr)
+      if (cr['status'] == 200 && coverBytesOk(cr['bytes'])) {
+        DL_COVER_DATA = base64Encode(cr['bytes'])
+        log("封面已内联：${cr['bytes'].length} 字节（base64 ${DL_COVER_DATA.length} 字符）")
+      } else if (cr['bytes'] != null && cr['bytes'].length > COVER_MAX_BYTES) {
+        log("封面过大（${cr['bytes'].length} 字节 > ${COVER_MAX_BYTES}），放弃内联，降级用 URL")
+      } else {
+        log("封面抓取失败（忽略，降级用 URL）：HTTP ${cr['status']}")
+      }
+      fetchKeyThenContent(DL_BOOK_ID, DL_SELECTED, DL_USE_BATCH)
+    })
+  }
+}
+
+// ------------------------- 失败处理：上报失效设备换设备重试 / 手动换签名地址 / 交回部分结果 -------------------------
+
+// 按 op['kind'] 回到对应阶段重试（op 是跨 ask 回调传递的操作描述）
+function retryDownloadOp(op) {
+  if (op['kind'] == 'key') {
+    fetchKeyThenContent(op['bookId'], op['selected'], op['useBatch'])
+  } else if (op['kind'] == 'batch') {
+    fetchBatches(op['bookId'], op['selected'], op['keyHex'], op['from'], op['size'], op['contents'])
+  } else {
+    fetchSingles(op['bookId'], op['selected'], op['keyHex'], op['index'], op['contents'])
+  }
+}
+
+// 最终失败：detail 交回空详情；download 若已取到部分章节则照常交回（不丢进度），否则空章节
+function failOp(op, reason) {
+  if (op['kind'] == 'detail') {
+    result({'id': op['id'], 'title': '', 'author': '', 'description': '', 'cover': ''})
+  } else if (op['kind'] == 'key') {
+    // 密钥阶段还没取到任何正文，只能空章节（有日志说明原因）
+    result({'chapters': []})
+  } else {
+    var selected = op['selected']
+    var contents = op['contents']
+    var rangeLabel = ''
+    if (op['kind'] == 'single') {
+      rangeLabel = "第 ${op['index'] + 1} 章"
+    } else {
+      var to = op['from'] + op['size']
+      if (to > selected.length) { to = selected.length }
+      rangeLabel = "第 ${op['from'] + 1}~${to} 章"
+    }
+    finishPartial(selected, contents, reason + "（已按失败路径处理）", rangeLabel)
+  }
+}
+
+// 设备/风控失败统一入口：
+// 1) 有 device 且本次运行还没上报过 ⇒ POST /device/report 后换设备重试一次（绝不循环）；
+// 2) 否则本次还没手动换过签名地址 ⇒ 问一次是否换签名地址（明文；取消/无界面=不换）；
+// 3) 都不行 ⇒ 交回已取到的部分章节（failOp），绝不丢进度。
+// 触发：正文 code=110/100、HTTP 200 空体/非 JSON；/sign 非 200 时若带 device 也走上报。
+function handleDownloadFailure(op, reason, device) {
+  log("【下载失败】阶段=${op['kind']} device=${device} 原因：${reason}")
+  if (device != '' && !deviceReported) {
+    deviceReported = true
+    var rurl = deviceReportUrl()
+    log("上报失效设备：POST ${rurl}（id=${device}），随后换设备重试一次")
+    httpRequest({'url': rurl, 'method': 'POST', 'body': '{"id":"' + device + '"}', 'contentType': 'application/json'}).then((rr) {
+      var st = rr['status'] == null ? 0 : parseInt("${rr['status']}")
+      log("设备上报结果：HTTP ${st} ${previewText(rr['text'], 200)}")
+      if (st == 409) {
+        log("该设备为主设备（/device/report 返回 409，受保护），跳过上报与换设备，按失败路径交回已取到的章节")
+        failOp(op, reason)
+      } else if (st == 429) {
+        log("设备上报被限流（429，全局 10 秒一次），本轮跳过上报，按失败路径交回已取到的章节")
+        failOp(op, reason)
+      } else {
+        // 换设备重试：解除设备固定，让下一次 /sign 重新选一台
+        poolDevice = ''
+        poolDeviceId = ''
+        retryDownloadOp(op)
+      }
+    })
+  } else if (!signAsked) {
+    signAsked = true
+    ask("下载失败：${reason}\n是否换一个签名地址重试一次？留空或取消=按原样结束（示例：http://127.0.0.1:8090/sign）", {'default': ''}).then((reply) {
+      var ans = ''
+      if (reply['ok']) { ans = "${reply['answer']}" }
+      if (ans != '' && ans != signUrl) {
+        signUrl = ans
+        poolDevice = ''
+        poolDeviceId = ''
+        log("已切换签名地址，重试一次：${ans}")
+        retryDownloadOp(op)
+      } else {
+        log('未更换签名地址，按失败路径交回已取到的章节')
+        failOp(op, reason)
+      }
+    })
+  } else {
+    failOp(op, reason)
+  }
+}
+
+// ------------------------- 超长书下载前确认范围 -------------------------
+
+// 解析范围回答：空/全部/all => 全部（start=0 作「沿用原参数」哨兵）；a-b => 区间；n => 前 n 章；
+// 无法解析 => 全部并 log 说明。返回 {'start','end'}。
+function parseRangeAnswer(ans, total) {
+  var out = {}
+  out['start'] = 0
+  out['end'] = 0
+  var a = cleanText("${ans}", [['^\\s+', ''], ['\\s+$', '']])
+  if (a == '' || a == '全部' || a == 'all' || a == 'ALL' || a == 'All') {
+    log('范围回答：全部')
+    return out
+  }
+  // 注意：正则字面量不能直接写进 "${...}"（外层字符串会先处理反斜杠导致模式失效），
+  // 所以先取出匹配结果，再做字符串化/比较。
+  var whole = regexp('^\\d+\\s*-\\s*\\d+$', a)
+  if (whole != '' && whole != null) {
+    var mg1 = regexp('^(\\d+)\\s*-\\s*\\d+$', a, '1')
+    var mg2 = regexp('^\\d+\\s*-\\s*(\\d+)$', a, '1')
+    var s = parseInt("${mg1}")
+    var e = parseInt("${mg2}")
+    if (s == null || e == null || s < 1 || e < s) {
+      log("范围回答无法解析（${a}），按全部下载")
+      return out
+    }
+    if (e > total) { e = total }
+    out['start'] = s
+    out['end'] = e
+    log("范围回答：第 ${s}~${e} 章")
+    return out
+  }
+  var justN = regexp('^\\d+$', a)
+  if (justN != '' && justN != null) {
+    var n = parseInt("${justN}")
+    if (n == null || n < 1) {
+      log("范围回答无法解析（${a}），按全部下载")
+      return out
+    }
+    if (n > total) { n = total }
+    out['start'] = 1
+    out['end'] = n
+    log("范围回答：前 ${n} 章")
+    return out
+  }
+  log("范围回答无法解析（${a}），按全部下载")
+  return out
+}
+
+// 按 start/end/maxCh 选出本次要下载的章节，进入元数据 + 正文下载
+function startDownloadSelection(bookId, ids, titles, total, start, end, maxCh, useBatch) {
+  var endIdx = (end <= 0) ? total : end
+  if (endIdx > total) { endIdx = total }
+  if (start > endIdx) { start = 1 }
+  if (maxCh > 0) { if (endIdx - start + 1 > maxCh) { endIdx = start + maxCh - 1 } }
+  var selected = []
+  for (var j = start - 1; j < endIdx; j = j + 1) {
+    var e = {}
+    e['id'] = ids[j]
+    e['title'] = titles[ids[j]] == null ? "第 ${j + 1} 章" : titles[ids[j]]
+    selected.add(e)
+  }
+  log("目录 ${total} 章，本次下载第 ${start}~${endIdx} 章（batch=${useBatch}）")
+  fetchBookMetaThenContent(bookId, selected, useBatch)
+}
+
+// 超长书且未显式给 end/max_chapters 时，开始取正文前问一次范围；
+// 短书/已给范围/阈值 <= 0 => 直接下载（默认不打扰）。取消/无界面 => 静默按全部继续。
+function maybeAskThenDownload(bookId, ids, titles, total, start, end, maxCh, useBatch) {
+  var threshold = parseInt10(param('ask_over_chapters', '150'), 150)
+  var explicitRange = (end > 0) || (maxCh > 0)
+  if (explicitRange || threshold <= 0 || total <= threshold) {
+    startDownloadSelection(bookId, ids, titles, total, start, end, maxCh, useBatch)
+  } else {
+    log("全书 ${total} 章 > 阈值 ${threshold}，下载前询问范围（取消=全部）")
+    ask("全书 ${total} 章。直接下载全部？也可输入范围：1-20 / 20 / 全部（留空=全部）", {'default': '全部'}).then((reply) {
+      if (reply['ok']) {
+        var r = parseRangeAnswer(reply['answer'], total)
+        if (r['start'] > 0) {
+          startDownloadSelection(bookId, ids, titles, total, r['start'], r['end'], 0, useBatch)
+        } else {
+          startDownloadSelection(bookId, ids, titles, total, start, end, maxCh, useBatch)
+        }
+      } else {
+        log('未获得范围回答（取消/无界面），按全部继续')
+        startDownloadSelection(bookId, ids, titles, total, start, end, maxCh, useBatch)
+      }
+    })
+  }
+}
+
+// ------------------------- 开始时选择签名节点（仅 download） -------------------------
+
+// 归一化签名节点回答（去首尾空白）：
+//   ''                    => 默认 https://fq.gzxz.us.ci/sign
+//   无 scheme（host[:port]）=> 补 https://，再补 /sign
+//   有 scheme 无 /sign      => 补 /sign
+//   已以 /sign 结尾         => 原样
+function normalizeSignNode(ans) {
+  var a = cleanText("${ans}", [['^\\s+', ''], ['\\s+$', '']])
+  if (a == '') { return 'https://fq.gzxz.us.ci/sign' }
+  if (regexp('^https?://', a) == '') { a = 'https://' + a }
+  if (regexp('/sign$', a) == '') { a = a + '/sign' }
+  return a
+}
+
+// 取目录 → 选章 → 取正文（原 runDownload 内联主体，抽成具名函数供 ask 回调调用）
+function beginDownload(bookId, start, end, maxCh, useBatch, dirUrl) {
+  log("获取目录：${dirUrl}")
+  logReq('目录', 'GET', dirUrl)
+  var dh = {}
+  dh['User-Agent'] = WEB_UA
+  dh['Accept'] = 'application/json, text/plain, */*'
+  httpRequest({'url': dirUrl, 'method': 'GET', 'headers': dh}).then((dr) {
+    logResp('目录', dr)
+    if (dr['status'] != 200) {
+      log("目录失败：HTTP ${dr['status']}")
+      result({'chapters': []})
+    } else if (!looksJson(dr['text'])) {
+      log("目录响应非 JSON（HTTP ${dr['status']}），响应前 200 字符：${previewText(dr['text'], 200)}")
+      result({'chapters': []})
+    } else {
+      var dir = JSON.parse(dr['text'])
+      var data = dir['data']
+      if (data == null) {
+        log('目录为空（书籍可能已下架）')
+        result({'chapters': []})
+      } else {
+        var titles = {}
+        var vols = data['chapterListWithVolume']
+        if (vols != null) {
+          for (var vi = 0; vi < vols.length; vi = vi + 1) {
+            var vol = vols[vi]
+            for (var ci = 0; ci < vol.length; ci = ci + 1) {
+              var ch = vol[ci]
+              if (ch['itemId'] != null) {
+                var iid = "${ch['itemId']}"
+                if (titles[iid] == null) {
+                  titles[iid] = ch['title'] == null ? '' : "${ch['title']}"
+                }
+              }
+            }
+          }
+        }
+        var ids = []
+        var all = data['allItemIds']
+        if (all != null) {
+          for (var i = 0; i < all.length; i = i + 1) { ids.add("${all[i]}") }
+        }
+        if (ids.length == 0) {
+          log('目录无章节（书籍可能需登录/已下架）')
+          result({'chapters': []})
+        } else {
+          var total = ids.length
+          log('[目录] 解析成功：共 ${total} 章')
+          maybeAskThenDownload(bookId, ids, titles, total, start, end, maxCh, useBatch)
+        }
+      }
+    }
+  })
+}
+
+// download 最开始：可选询问签名节点（默认 fq.gzxz.us.ci），回答非空改写全局 signUrl，
+// 再进入 beginDownload。取消/无界面 => 保持原 signUrl（param 或默认值）继续，绝不失败。
+function askSignNodeThenDownload(bookId, start, end, maxCh, useBatch, dirUrl) {
+  var sw = param('ask_sign_node', '1')
+  if (sw == '0' || sw == 'false' || sw == 'no' || sw == 'False') {
+    beginDownload(bookId, start, end, maxCh, useBatch, dirUrl)
+  } else {
+    ask("使用哪个签名节点？（默认 fq.gzxz.us.ci）", {'default': 'fq.gzxz.us.ci'}).then((reply) {
+      if (reply['ok']) {
+        signUrl = normalizeSignNode(reply['answer'])
+        log("使用签名节点：${signUrl}")
+      } else {
+        log("未获得签名节点回答（取消/无界面），保持原签名地址：${signUrl}")
+      }
+      beginDownload(bookId, start, end, maxCh, useBatch, dirUrl)
+    })
+  }
+}
+
+function runDownload() {
+  var bookId = param('id', '')
+  if (bookId == '') {
+    log('下载缺少 id')
+    result({'chapters': []})
+  } else {
+    var start = parseInt10(param('start', '1'), 1)
+    if (start < 1) { start = 1 }
+    var end = parseInt10(param('end', '0'), 0)
+    var maxCh = parseInt10(param('max_chapters', '0'), 0)
+    if (maxCh < 0) { maxCh = 0 }
+    var b = param('batch', '1')
+    var useBatch = true
+    if (b == '0' || b == 'false' || b == 'no' || b == 'False') { useBatch = false }
+    var dirUrl = param('directory_url', DIRECTORY_URL + '?bookId=' + bookId)
+    var gs = param('group_size', '50')
+    var th = param('ask_over_chapters', '150')
+    log('[参数] id=${bookId} start=${start} end=${end} max_chapters=${maxCh} batch=${useBatch} group_size=${gs} ask_over_chapters=${th} auto_halve=${AUTO_HALVE} sign_url=${signUrl} api_base=${apiBase}')
+    askSignNodeThenDownload(bookId, start, end, maxCh, useBatch, dirUrl)
+  }
+}
+
+// ------------------------- 入口 -------------------------
+
+if (task == 'search') {
+  runSearch()
+} else if (task == 'detail') {
+  runDetail()
+} else if (task == 'download') {
+  runDownload()
+} else {
+  log("未知任务：${task}")
+  result({'items': []})
+}

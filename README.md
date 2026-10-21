@@ -233,6 +233,23 @@ curl -X POST -H 'Content-Type: application/json' -d '{"id":"3489"}' http://127.0
   `429 {"ok":false,"error":"report rate limited","retry_after":10}`。
 - 服务**启动时会把整池全部重注册**。
 
+## 配套书源插件（readerplus）
+
+根目录的 [`fanqie_source.ht`](fanqie_source.ht) 是配套的 **readerplus 书源脚本**（Hetu），
+直接复用本服务的 `/sign`、`/device`、`/device/report`：
+
+1. 把 `fanqie_source.ht` 传到手机
+2. readerplus → 插件/书源 → 导入该文件
+3. 搜索任意书 → 下载时会先问签名节点（默认 `fq.gzxz.us.ci`）
+
+要点：
+
+- 正文签名走 `POST /sign`，首次返回后**固定同一台设备**（后续请求带 `device`），保证「设备 ↔ 签名 ↔ 密钥」一致
+- 解密密钥**现取现用**：用 `device_info.device_id` 调 `registerkey` 拿真实 key；`/sign` 的 `key` 可能已过期，仅作兜底
+- 正文 `code=110/100` 或 HTTP 200 空体 ⇒ `POST /device/report` 换一台设备重试一次（409 主设备受保护 / 429 限流 则记日志跳过）
+- 常用参数：`sign_url`、`ask_sign_node`（默认 `1`）、`group_size`（默认 50）、
+  `ask_over_chapters`（默认 150）、`auto_halve`（默认 `0`，开启后单批文本超 `batch_text_limit` 才自动折半）
+
 ## 可调参数（环境变量）
 
 | 变量 | 默认 | 说明 |
