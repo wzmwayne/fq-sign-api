@@ -28,7 +28,11 @@
 //
 // 参数（均可用 param 覆盖）：
 //   task           search / download（宿主注入；detail 仅向后兼容，应用不再调用）
-//   query          搜索关键词（search）
+//   query          搜索内容（search），三种形态都支持：
+//                  1) 纯 book_id（15 位以上数字）⇒ 只返回这一本（签名详情接口取元数据）
+//                  2) 分享文案（含 https://changdunovel.com/t/xxx 等短链）⇒ 跟随 302 取长链
+//                     里的 book_id，该本置顶，再用书名号《…》里的文字搜 10 条补充
+//                  3) 普通关键词 ⇒ 搜索接口最多 10 条
 //   cover_inline   '1'/'true'（默认，搜索时把每条封面字节内联为 coverData）/ '0'/'false' 关闭
 //   id             书籍 book_id（detail / download）
 //   page           页码（search，当前仅支持第 1 页）
@@ -432,70 +436,229 @@ function inlineSearchCovers(items, candidates) {
   }
 }
 
+// ------------------------- 搜索入口：book_id / 分享文案 / 关键词 -------------------------
+// 三种输入都能搜：
+//   1) 纯 book_id（15 位以上数字）⇒ 只返回这一本（详情接口取元数据）
+//   2) 分享文案（含 https://changdunovel.com/t/xxx 短链）⇒ 跟随 302 取长链里的 book_id，
+//      该书本详情**置顶**，再用书名号《…》里的文字搜 10 条补充
+//   3) 普通关键词 ⇒ 走搜索接口（最多 10 条）
+// 三种路径最后都汇到 finishSearch()，统一按 cover_inline 决定要不要内联封面。
+
+var S_ITEMS = []
+var S_CANDS = []
+var S_KEYWORD = ''
+var S_ONLY_ONE = false
+var S_COVER_INLINE = true
+
+function isBookIdQuery(q) {
+  return regexp('^\\d{15,}$', "${q}") != ''
+}
+
+// 从分享文案里取第一个链接（排除空格与常见中文标点/右括号，避免把「）」粘进来）
+function extractShareLink(text) {
+  return regexp('https?://[^\\s，。；、）】]+', "${text}")
+}
+
+// 从（跟随跳转后的）URL 里取 book_id；兼容 /page/<id> 与裸数字路径
+function bookIdFromUrl(url) {
+  var u = "${url}"
+  var id = regexp('[?&]book_id=(\\d+)', u, '1')
+  if (id == '') { id = regexp('/page/(\\d+)', u, '1') }
+  if (id == '') { id = regexp('(\\d{15,})', u, '1') }
+  return id
+}
+
+function extractShareTitle(text) {
+  return regexp('《([^》]+)》', "${text}", '1')
+}
+
+function searchHasId(id) {
+  for (var i = 0; i < S_ITEMS.length; i = i + 1) {
+    if ("${S_ITEMS[i]['id']}" == "${id}") { return true }
+  }
+  return false
+}
+
+function finishSearch() {
+  var kw = S_KEYWORD == '' ? '（无）' : S_KEYWORD
+  log("搜索完成：共 ${S_ITEMS.length} 条，仅一本=${S_ONLY_ONE}，补充关键词=${kw}")
+  if (S_COVER_INLINE) {
+    inlineSearchCovers(S_ITEMS, S_CANDS)
+  } else {
+    result({'items': S_ITEMS})
+  }
+}
+
+// 详情取完后的分岔：book_id 模式只要这一本；分享模式再补 10 条；无关键词就直接交回
+function continueAfterDetail() {
+  if (S_ONLY_ONE || S_KEYWORD == '') {
+    finishSearch()
+  } else {
+    keywordSearch(S_KEYWORD, 10)
+  }
+}
+
+// 用签名详情接口取一本书的元数据，追加到结果列表头部
+function searchBookDetail(id) {
+  var url = apiBase + '/reading/bookapi/detail/v1' + fqQuery([['book_id', id]])
+  log('[阶段] 取书目详情：book_id=${id}')
+  logReq('详情', 'GET', url)
+  httpRequest(signOptionsFor(url)).then((sr) {
+    logResp('详情', sr)
+    if (sr['status'] != 200) {
+      log("详情签名失败：HTTP ${sr['status']}，响应前 200 字符：${previewText(sr['text'], 200)}")
+      continueAfterDetail()
+    } else if (!looksJson(sr['text'])) {
+      log("详情签名返回非 JSON（HTTP ${sr['status']}）：${previewText(sr['text'], 200)}")
+      continueAfterDetail()
+    } else {
+      var env = JSON.parse(sr['text'])
+      if (env == null || env['ok'] != true) {
+        log("详情签名返回异常：${previewText(sr['text'], 200)}")
+        continueAfterDetail()
+      } else {
+        captureSignEnv(env)
+        var headers = fqHeaders()
+        applyEnvHeaders(headers, env)
+        var envUrl = env['url'] == null ? url : "${env['url']}"
+        logReq('详情', 'GET', envUrl)
+        httpRequest({'url': envUrl, 'method': 'GET', 'headers': headers}).then((r) {
+          logResp('详情', r)
+          if (r['status'] == 200 && looksJson(r['text'])) {
+            var root = JSON.parse(r['text'])
+            var code = (root == null || root['code'] == null) ? -1 : parseInt("${root['code']}")
+            if (code == 0 && root['data'] != null) {
+              var meta = bookMetaFromData(root['data'])
+              var item = {}
+              item['id'] = id
+              item['title'] = meta['title']
+              item['author'] = meta['author']
+              item['cover'] = meta['cover']
+              item['intro'] = meta['description']
+              item['description'] = meta['description']
+              item['coverData'] = ''
+              S_ITEMS.add(item)
+              var list = []
+              if (meta['cover'] != '') { list.add(meta['cover']) }
+              S_CANDS.add(list)
+              log("置顶书目：${meta['title']} / ${meta['author']}")
+            } else {
+              log("详情失败：code=${code}，message=${root == null ? '' : root['message']}")
+            }
+          } else {
+            log("详情响应异常：HTTP ${r['status']}，响应前 200 字符：${previewText(r['text'], 200)}")
+          }
+          continueAfterDetail()
+        })
+      }
+    }
+  })
+}
+
+// 关键词搜索，最多补 limit 条（跳过已置顶的同一本书）
+function keywordSearch(q, limit) {
+  var url = SEARCH_URL + '?q=' + urlEncode(q) + '&aid=1967'
+  log('[阶段] 关键词搜索：${q}（最多 ${limit} 条）')
+  logReq('搜索', 'GET', url)
+  var headers = {}
+  headers['User-Agent'] = WEB_UA
+  headers['Accept'] = 'application/json, text/plain, */*'
+  httpRequest({'url': url, 'method': 'GET', 'headers': headers}).then((r) {
+    logResp('搜索', r)
+    if (r['status'] != 200) {
+      log("搜索失败：HTTP ${r['status']}，响应前 200 字符：${previewText(r['text'], 200)}")
+      finishSearch()
+    } else if (!looksJson(r['text'])) {
+      log("搜索响应非 JSON（HTTP ${r['status']}），响应前 200 字符：${previewText(r['text'], 200)}")
+      finishSearch()
+    } else {
+      var root = JSON.parse(r['text'])
+      var data = root == null ? null : root['data']
+      var added = 0
+      if (data != null) {
+        var ret = data['ret_data']
+        if (ret != null) {
+          for (var i = 0; i < ret.length; i = i + 1) {
+            if (added < limit) {
+              var v = ret[i]
+              var bid = v['book_id'] == null ? '' : "${v['book_id']}"
+              if (bid != '' && !searchHasId(bid)) {
+                var item = {}
+                item['id'] = bid
+                item['title'] = v['title'] == null ? '' : "${v['title']}"
+                item['author'] = v['author'] == null ? '' : "${v['author']}"
+                // 番茄搜索接口的封面字段是 thumb_url（旧脚本误写成 thumb，永远取不到）
+                var thumb = v['thumb_url'] == null ? '' : "${v['thumb_url']}"
+                var audio = v['audio_thumb_uri'] == null ? '' : "${v['audio_thumb_uri']}"
+                var cover = fixCoverUrl(thumb)
+                item['cover'] = cover
+                var abstract = v['abstract'] == null ? '' : "${v['abstract']}"
+                item['intro'] = abstract
+                item['description'] = abstract
+                item['coverData'] = ''
+                S_ITEMS.add(item)
+                var list = []
+                if (cover != '') { list.add(cover) }
+                var af = fixCoverUrl(audio)
+                if (af != '' && af != cover) { list.add(af) }
+                if (thumb != '' && thumb != cover && thumb != af) { list.add(thumb) }
+                S_CANDS.add(list)
+                added = added + 1
+              }
+            }
+          }
+        }
+      }
+      log("关键词命中 ${added} 条")
+      finishSearch()
+    }
+  })
+}
+
 function runSearch() {
-  var q = param('query', '')
+  var raw = param('query', '')
+  var q = cleanText("${raw}", [['^\\s+', ''], ['\\s+$', '']])
   if (q == '') {
     log('搜索关键词为空')
     result({'items': []})
   } else {
     var ci = param('cover_inline', '1')
-    var coverInline = true
-    if (ci == '0' || ci == 'false' || ci == 'no' || ci == 'False') { coverInline = false }
-    var url = SEARCH_URL + '?q=' + urlEncode(q) + '&aid=1967'
-    log('搜索：' + q)
-    var headers = {}
-    headers['User-Agent'] = WEB_UA
-    headers['Accept'] = 'application/json, text/plain, */*'
-    httpRequest({'url': url, 'method': 'GET', 'headers': headers}).then((r) {
-      if (r['status'] != 200) {
-        log("搜索失败：HTTP ${r['status']}，响应前 200 字符：${previewText(r['text'], 200)}")
-        result({'items': []})
-      } else if (!looksJson(r['text'])) {
-        log("搜索响应非 JSON（HTTP ${r['status']}），响应前 200 字符：${previewText(r['text'], 200)}")
-        result({'items': []})
+    S_COVER_INLINE = true
+    if (ci == '0' || ci == 'false' || ci == 'no' || ci == 'False') { S_COVER_INLINE = false }
+    S_ITEMS = []
+    S_CANDS = []
+    S_KEYWORD = ''
+    S_ONLY_ONE = false
+    if (isBookIdQuery(q)) {
+      S_ONLY_ONE = true
+      log("识别为 book_id：${q}（只返回这一本）")
+      searchBookDetail(q)
+    } else {
+      var link = extractShareLink(q)
+      var title = extractShareTitle(q)
+      if (link == '') {
+        keywordSearch(q, 10)
       } else {
-        var root = JSON.parse(r['text'])
-        var data = root == null ? null : root['data']
-        var items = []
-        var candidates = []
-        if (data != null) {
-          var ret = data['ret_data']
-          if (ret != null) {
-            for (var i = 0; i < ret.length; i = i + 1) {
-              var v = ret[i]
-              var item = {}
-              item['id'] = v['book_id'] == null ? '' : "${v['book_id']}"
-              item['title'] = v['title'] == null ? '' : "${v['title']}"
-              item['author'] = v['author'] == null ? '' : "${v['author']}"
-              // 番茄搜索接口的封面字段是 thumb_url（旧脚本误写成 thumb，永远取不到）。
-              // 规范化后作为 cover；原 audio_thumb_uri / 原 thumb_url 只作抓取兜底候选。
-              var thumb = v['thumb_url'] == null ? '' : "${v['thumb_url']}"
-              var audio = v['audio_thumb_uri'] == null ? '' : "${v['audio_thumb_uri']}"
-              var cover = fixCoverUrl(thumb)
-              item['cover'] = cover
-              var abstract = v['abstract'] == null ? '' : "${v['abstract']}"
-              item['intro'] = abstract
-              item['description'] = abstract
-              // coverData 默认空；开启 cover_inline 时由内联抓取填充
-              item['coverData'] = ''
-              items.add(item)
-              var list = []
-              if (cover != '') { list.add(cover) }
-              var af = fixCoverUrl(audio)
-              if (af != '' && af != cover) { list.add(af) }
-              if (thumb != '' && thumb != cover && thumb != af) { list.add(thumb) }
-              candidates.add(list)
-            }
+        var tshow = title == '' ? '（无）' : title
+        log("识别为分享文案：链接=${link}，书名=${tshow}")
+        logReq('分享短链', 'GET', link)
+        httpRequest({'url': link, 'method': 'GET', 'headers': {'User-Agent': WEB_UA}}).then((lr) {
+          logResp('分享短链', lr)
+          var finalUrl = lr['url'] == null ? '' : "${lr['url']}"
+          var bookId = bookIdFromUrl(finalUrl)
+          if (bookId == '') { bookId = bookIdFromUrl(link) }
+          if (bookId == '') {
+            log("分享链接未解析出 book_id（最终 URL=${finalUrl}），回退为关键词搜索")
+            S_KEYWORD = title == '' ? q : title
+            keywordSearch(S_KEYWORD, 10)
+          } else {
+            log("分享解析成功：book_id=${bookId}")
+            S_KEYWORD = title
+            searchBookDetail(bookId)
           }
-        }
-        log("命中 ${items.length} 条（cover_inline=${coverInline}）")
-        if (coverInline) {
-          inlineSearchCovers(items, candidates)
-        } else {
-          result({'items': items})
-        }
+        })
       }
-    })
+    }
   }
 }
 
