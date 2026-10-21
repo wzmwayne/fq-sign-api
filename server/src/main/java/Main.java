@@ -312,6 +312,18 @@ curl -X POST -H 'Content-Type: application/json' -d '{"id":"3489"}' https://<你
     }
 
     /** 把 .so 返回的多行签名文本（头名/值成对）转成 JSON 对象 */
+    /** Map<String,String> → JSON 对象（转义值） */
+    static String mapToJson(Map<String, String> m) {
+        StringBuilder b = new StringBuilder("{");
+        boolean first = true;
+        for (Map.Entry<String, String> e : m.entrySet()) {
+            if (!first) b.append(',');
+            first = false;
+            b.append('"').append(jesc(e.getKey())).append("\":\"").append(jesc(e.getValue())).append('"');
+        }
+        return b.append('}').toString();
+    }
+
     static String sigToJson(String sig) {
         if (sig == null) return "{}";
         String[] lines = sig.replace("\r\n", "\n").split("\n");
@@ -897,6 +909,7 @@ curl -X POST -H 'Content-Type: application/json' -d '{"id":"3489"}' https://<你
                                         + "\",\"device_id\":\"" + jesc(dev.deviceId)
                                         + "\",\"cdid\":\"" + jesc(dev.cdid) + "\"}"
                                         + ",\"cookie\":\"" + jesc(dev.cookie) + "\""
+                                        + ",\"req_headers\":" + mapToJson(LAST_SIG_HEADERS)
                                         + ",\"ua\":\"" + jesc(dev.ua) + "\"}", null);
                             } finally {
                                 worker.release();
@@ -1269,6 +1282,9 @@ curl -X POST -H 'Content-Type: application/json' -d '{"id":"3489"}' https://<你
         return (HttpURLConnection) new URL(url).openConnection();
     }
 
+    /** 最近一次签名实际使用的请求头（/sign 原样回传给调用方，避免客户端重算导致不一致） */
+    static volatile Map<String, String> LAST_SIG_HEADERS = java.util.Collections.emptyMap();
+
     static synchronized String getFqSig(String url) { return getFqSig(url, null); }
 
     /**
@@ -1278,6 +1294,7 @@ curl -X POST -H 'Content-Type: application/json' -d '{"id":"3489"}' https://<你
      */
     static synchronized String getFqSig(String url, Dev d) {
         Map<String, String> h = buildFqHeaders(d);
+        LAST_SIG_HEADERS = h;   // 签名覆盖的就是这份头：调用方必须原样发送
         StringBuilder sb = new StringBuilder();
         for (var e : h.entrySet())
             sb.append(e.getKey()).append("\r\n").append(e.getValue()).append("\r\n");

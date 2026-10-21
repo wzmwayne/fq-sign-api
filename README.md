@@ -155,9 +155,16 @@ curl -X POST -H 'Content-Type: application/json' \
   "url": "把 iid/device_id/cdid 换成该设备后的完整 URL",
   "device_info": {"install_id": "…", "device_id": "…", "cdid": "…"},
   "cookie": "与 url/签名一致的那台设备的 Cookie",
-  "ua": "与 url/签名一致的那台设备的 User-Agent"
+  "ua": "与 url/签名一致的那台设备的 User-Agent",
+  "req_headers": {"Cookie": "…", "x-ss-req-ticket": "…", "x-reading-request": "…", "…": "…"}
 }
 ```
+
+> ⚠️ **`req_headers` 必须原样发送**（再叠加 `headers` 里的 8 个签名头）。
+> 服务端的签名覆盖的就是这份头里的 `x-ss-req-ticket` / `x-reading-request` 等字段；
+> 客户端若自己重算这些时间戳头，签名与实际请求不一致，番茄会直接返回
+> `{"code":110,"message":"ILLEGAL_ACCESS"}`（实测：改用 `req_headers` 后立刻 `code:0`）。
+> `req_headers` 是**每次 `/sign` 新生成**的，不要跨请求缓存复用。
 
 > 请用返回的 `url` + `headers` 发真实请求；**真实请求的 `Cookie`/`User-Agent` 也必须用返回的
 > `cookie`/`ua`**（三者与签名一致，否则番茄可能返回空体）。

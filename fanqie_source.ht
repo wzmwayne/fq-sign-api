@@ -89,6 +89,11 @@ var DIRECTORY_URL = 'https://fanqienovel.com/api/reader/directory/detail'
 var FQ_UA = 'com.dragon.read.oversea.gp/68132 (Linux; U; Android 10; zh_CN; OnePlus11; Build/V291IR;tt-ok/3.12.13.4-tiktok)'
 var WEB_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
 var SIG_KEYS = ['X-Argus', 'X-Gorgon', 'X-Helios', 'X-Khronos', 'X-Ladon', 'X-Medusa', 'X-Neptune', 'X-Soter']
+// 服务端 buildFqHeaders 覆盖的 13 个基础头（/sign 的 req_headers 原样回传）
+var HDR_KEYS = ['Cookie', 'User-Agent', 'Accept', 'Accept-Encoding', 'x-xs-from-web',
+                'x-ss-req-ticket', 'x-reading-request', 'x-vc-bdturing-sdk-version',
+                'lc', 'sdk-version', 'passport-sdk-version',
+                'x-tt-store-region', 'x-tt-store-region-src']
 // 封面内联上限：番茄封面多为 100~300KB；>1MB 放弃内联，避免把结果撑爆
 var COVER_MAX_BYTES = 1048576
 // 单批「解码后 JSON 字符数」上限：仅当 auto_halve 打开时用于触发折半重试（此时尚未 JSON.parse）
@@ -157,8 +162,21 @@ function applySig(headers, sig) {
 // 新契约：签名响应还带 cookie / ua，必须一并用于真实请求（否则与设备/签名不符）
 function applyEnvHeaders(headers, env) {
   applySig(headers, env['headers'])
-  if (env['cookie'] != null) { headers['Cookie'] = "${env['cookie']}" }
-  if (env['ua'] != null) { headers['User-Agent'] = "${env['ua']}" }
+  // ★ 服务端签名覆盖的就是它自己那份头，必须【原样】发出去。
+  //   自己重算 x-ss-req-ticket / x-reading-request 会与签名不一致，
+  //   番茄会直接判 ILLEGAL_ACCESS(code=110)（实测：改用 req_headers 后立刻 code=0）。
+  var rh = env['req_headers']
+  if (rh != null) {
+    for (var i = 0; i < HDR_KEYS.length; i = i + 1) {
+      var k = HDR_KEYS[i]
+      var v = rh[k]
+      if (v != null) { headers[k] = "${v}" }
+    }
+  } else {
+    // 兼容旧版服务端（没有 req_headers）
+    if (env['cookie'] != null) { headers['Cookie'] = "${env['cookie']}" }
+    if (env['ua'] != null) { headers['User-Agent'] = "${env['ua']}" }
+  }
 }
 
 // 固化池设备：/sign 首次返回 device/device_info 后，后续 /sign 都带 device 固定它，
@@ -261,6 +279,50 @@ function looksJson(text) {
 
 // /device/report 地址：由 sign_url 去掉末尾 /sign 再拼 /device/report
 // （默认 https://fq.gzxz.us.ci/sign ⇒ https://fq.gzxz.us.ci/device/report）
+// /device 列表地址：由 sign_url 去掉末尾 /sign 再拼 /device
+function deviceListUrl() {
+  var base = cleanText("${signUrl}", [['/sign$', '']])
+  if (base == '') { return signUrl }
+  return base + '/device'
+}
+
+// 上报被拒（409 主设备受保护 / 429 限流）或上报失败时，直接从池里另选一台可用设备重试一次。
+// 关键：不能因为「主设备受保护」就整本放弃 —— 主设备失败时更应该换一台。
+function switchDeviceThenRetry(avoidId, op, reason) {
+  var url = deviceListUrl()
+  log("查询设备池，另选一台（避开 ${avoidId}）：GET ${url}")
+  logReq('设备列表', 'GET', url)
+  httpRequest({'url': url, 'method': 'GET'}).then((r) {
+    logResp('设备列表', r)
+    if (r['status'] != 200 || !looksJson(r['text'])) {
+      log("取设备列表失败（HTTP ${r['status']}），按失败路径交回已取到的章节")
+      failOp(op, reason)
+    } else {
+      var root = JSON.parse(r['text'])
+      var devices = root == null ? null : root['devices']
+      var picked = ''
+      if (devices != null) {
+        for (var i = 0; i < devices.length; i = i + 1) {
+          var d = devices[i]
+          var id = d['id'] == null ? '' : "${d['id']}"
+          if (picked == '' && id != '' && id != avoidId && d['ok'] == true) {
+            picked = id
+          }
+        }
+      }
+      if (picked == '') {
+        log("池中没有其它可用设备，按失败路径交回已取到的章节")
+        failOp(op, reason)
+      } else {
+        poolDevice = picked
+        poolDeviceId = ''
+        log("已切换到设备 ${picked}，重试本次请求")
+        retryDownloadOp(op)
+      }
+    }
+  })
+}
+
 function deviceReportUrl() {
   var base = cleanText("${signUrl}", [['/sign$', '']])
   if (base == '') { return signUrl }
@@ -355,7 +417,8 @@ function cleanBody(raw) {
 
 function readerErr(where, code, msg) {
   if (code == 110) {
-    return "${where}失败：ILLEGAL_ACCESS（code=110，设备被番茄风控/封禁）。请更换 device_id/install_id/cdid 后重启签名服务，或稍后再试。"
+    return "${where}失败：ILLEGAL_ACCESS（code=110）：番茄拒绝返回正文。"
+      + "可能原因：①该设备/IP 被风控 ②该书受限 ③签名与实际请求不一致。脚本会自动尝试换设备一次。"
   }
   if (code == 100) {
     return "${where}失败：FAST_REJECT（code=100，请求过快），请降低频率后重试。"
@@ -1225,17 +1288,21 @@ function handleDownloadFailure(op, reason, device) {
     httpRequest({'url': rurl, 'method': 'POST', 'body': '{"id":"' + device + '"}', 'contentType': 'application/json'}).then((rr) {
       var st = rr['status'] == null ? 0 : parseInt("${rr['status']}")
       log("设备上报结果：HTTP ${st} ${previewText(rr['text'], 200)}")
-      if (st == 409) {
-        log("该设备为主设备（/device/report 返回 409，受保护），跳过上报与换设备，按失败路径交回已取到的章节")
-        failOp(op, reason)
-      } else if (st == 429) {
-        log("设备上报被限流（429，全局 10 秒一次），本轮跳过上报，按失败路径交回已取到的章节")
-        failOp(op, reason)
-      } else {
-        // 换设备重试：解除设备固定，让下一次 /sign 重新选一台
+      if (st == 200) {
+        // 服务端已删除该设备并补了一台新设备：解除固定，让下一次 /sign 重新选
         poolDevice = ''
         poolDeviceId = ''
+        log("已上报并换新设备，重试本次请求")
         retryDownloadOp(op)
+      } else if (st == 409) {
+        log("该设备为主设备（受保护，409）：改为从池中另选一台设备重试")
+        switchDeviceThenRetry(device, op, reason)
+      } else if (st == 429) {
+        log("上报被限流（429，全局 10 秒一次）：直接从池中另选一台设备重试")
+        switchDeviceThenRetry(device, op, reason)
+      } else {
+        log("设备上报未成功（HTTP ${st}）：直接从池中另选一台设备重试")
+        switchDeviceThenRetry(device, op, reason)
       }
     })
   } else if (!signAsked) {
